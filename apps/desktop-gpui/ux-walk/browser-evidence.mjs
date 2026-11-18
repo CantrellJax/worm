@@ -164,6 +164,9 @@ export function sanitizeBrowserEvent(raw, receivedAt = Date.now()) {
 	return result;
 }
 
+const NOT_OWNED_WINDOW =
+	"The selected source is not the browser window opened for this walk";
+
 const unavailable = (reason = "not captured") => ({
 	events: [],
 	coverage: { dom: reason, network: reason, console: reason },
@@ -192,7 +195,7 @@ export function projectBrowserEvidence(file, journal) {
 			...unavailable(
 				`not captured: ${metadata.reason || "browser collector unavailable"}`,
 			),
-			ownedWindow: false,
+			ownedWindow: metadata.reason !== NOT_OWNED_WINDOW,
 		};
 	if (
 		metadata.schemaVersion !== 1 ||

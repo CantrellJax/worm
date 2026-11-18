@@ -962,7 +962,7 @@ export async function runCheckpointWorker(file, cfg, dependencies = {}) {
 				});
 				break;
 			} catch (error) {
-				if (isWalkBusy(error) && Date.now() < retryUntil) {
+				if (isWalkBusy(error, "processing") && Date.now() < retryUntil) {
 					await pause(Math.min(1000, Math.max(0, retryUntil - Date.now())));
 					continue;
 				}

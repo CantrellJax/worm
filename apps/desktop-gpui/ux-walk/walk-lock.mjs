@@ -20,10 +20,11 @@ const busy = (scope) =>
 				? "This walk is already being processed, or its ownership socket is busy."
 				: "This recording already has a checkpoint operation, or its ownership socket is busy. Wait for evidence sync to finish.",
 		),
-		{ code: "WALK_BUSY" },
+		{ code: "WALK_BUSY", scope },
 	);
 
-export const isWalkBusy = (error) => error?.code === "WALK_BUSY";
+export const isWalkBusy = (error, scope) =>
+	error?.code === "WALK_BUSY" && error.scope === scope;
 
 function identity(directory, scope) {
 	if (!Object.hasOwn(folders, scope))

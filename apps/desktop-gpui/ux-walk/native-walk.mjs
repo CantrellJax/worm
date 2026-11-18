@@ -424,8 +424,8 @@ const MIN_BRIEF_S = 20;
 const retryItemsCommand = (file) =>
 	`${quote(process.execPath)} ${quote(fileURLToPath(import.meta.url))} retry-items ${quote(file)}`;
 
-function chaptersMissingItems(directory, journal, cfg) {
-	if (!(isDiatribe(journal) || cfg.brief === true)) return [];
+function chaptersMissingItems(directory, journal, cfg, wanted = false) {
+	if (!(wanted || isDiatribe(journal) || cfg.brief === true)) return [];
 	let chapters;
 	try {
 		chapters = JSON.parse(
@@ -438,7 +438,8 @@ function chaptersMissingItems(directory, journal, cfg) {
 		const transcript = path.join(directory, chapter.dir, "transcript.srt");
 		return (
 			chapter.status === "ready" &&
-			(chapter.endMs - chapter.startMs) / 1000 >= MIN_BRIEF_S &&
+			(isDiatribe(journal) ||
+				(chapter.endMs - chapter.startMs) / 1000 >= MIN_BRIEF_S) &&
 			fs.existsSync(transcript) &&
 			fs.statSync(transcript).size > 0 &&
 			!fs.existsSync(path.join(directory, chapter.dir, "items.json"))
@@ -454,7 +455,15 @@ function itemsNotice(file, missing, error) {
 async function refreshItems(file, cfg, { retry, dependencies = {} }) {
 	const journal = readJournal(file);
 	const directory = journal.request.directory;
-	let missing = chaptersMissingItems(directory, journal, cfg);
+	const status = path.join(directory, "processing.json");
+	let state;
+	try {
+		state = JSON.parse(fs.readFileSync(status, "utf8"));
+	} catch {}
+	const wanted = state?.items === "missing";
+	let missing = chaptersMissingItems(directory, journal, cfg, wanted);
+	if (!missing.length && (state?.items ?? "ready") === "ready")
+		return { missing: [], error: null };
 	const failures = [];
 	if (retry) {
 		for (const chapter of missing) {
@@ -467,14 +476,9 @@ async function refreshItems(file, cfg, { retry, dependencies = {} }) {
 				failures.push(`${chapter.name}: ${error.message}`);
 			}
 		}
-		missing = chaptersMissingItems(directory, journal, cfg);
+		missing = chaptersMissingItems(directory, journal, cfg, wanted);
 	}
 	const error = failures.join("; ").slice(0, 500) || null;
-	const status = path.join(directory, "processing.json");
-	let state;
-	try {
-		state = JSON.parse(fs.readFileSync(status, "utf8"));
-	} catch {}
 	if (state) {
 		const { itemsError: _dropped, ...rest } = state;
 		save(status, {
@@ -486,12 +490,11 @@ async function refreshItems(file, cfg, { retry, dependencies = {} }) {
 	const report = path.join(directory, "report.html");
 	if (fs.existsSync(report)) {
 		const html = fs.readFileSync(report, "utf8");
-		if (ITEMS_MARKER.test(html))
-			fs.writeFileSync(
-				report,
-				html.replace(ITEMS_MARKER, () => itemsNotice(file, missing, error)),
-				{ mode: 0o600 },
-			);
+		const notice = itemsNotice(file, missing, error);
+		const updated = ITEMS_MARKER.test(html)
+			? html.replace(ITEMS_MARKER, () => notice)
+			: html.replace("<h2>Notes</h2>", () => `${notice}<h2>Notes</h2>`);
+		if (updated !== html) fs.writeFileSync(report, updated, { mode: 0o600 });
 	}
 	return { missing: missing.map((chapter) => chapter.dir), error };
 }
@@ -621,7 +624,9 @@ export async function finishNativeWalk(file, loaded, dependencies = {}) {
 				(previous.state === "ready" && previous.transcript !== "partial")
 			) {
 				if (previous?.state === "ready")
-					await refreshItems(file, cfg, { retry: true, dependencies });
+					await refreshItems(file, cfg, { retry: true, dependencies }).catch(
+						() => {},
+					);
 				return directory;
 			}
 			if (

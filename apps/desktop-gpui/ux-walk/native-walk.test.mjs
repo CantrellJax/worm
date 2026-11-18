@@ -2063,3 +2063,50 @@ test("the start page is not claimed when the recording is not the walk's browser
 	assert.equal(JSON.parse(read("session.json")).url, null);
 	assert.doesNotMatch(read("report.html"), /example\.com/);
 });
+
+test("a retry still runs for a walk marked missing after the brief setting is turned off", async (t) => {
+	const f = await walkWithoutItems(t);
+	assert.equal(f.status().items, "missing");
+	const result = await retryWalkItems(
+		f.file,
+		{ ...f.cfg, brief: false },
+		{
+			runBrief: async (directory) =>
+				fs.writeFileSync(
+					path.join(directory, "items.json"),
+					JSON.stringify({ items: [] }),
+				),
+		},
+	);
+	assert.deepEqual(result.missing, []);
+	assert.equal(f.status().items, "ready");
+});
+
+test("a report written before the notice existed gets it on retry", async (t) => {
+	const f = await walkWithoutItems(t);
+	fs.writeFileSync(
+		path.join(f.directory, "report.html"),
+		f
+			.read("report.html")
+			.replace(/<!--items-notice-->[\s\S]*?<!--\/items-notice-->/, ""),
+	);
+	await retryWalkItems(f.file, f.cfg, {
+		runBrief: async () => {
+			throw new Error("offline");
+		},
+	});
+	assert.match(f.read("report.html"), /No action items yet/);
+});
+
+test("a failing refresh does not demote a ready walk", async (t) => {
+	const f = await walkWithoutItems(t);
+	fs.rmSync(path.join(f.directory, "report.html"));
+	fs.mkdirSync(path.join(f.directory, "report.html"));
+	await finishNativeWalk(f.file, f.cfg, {
+		reconcileStopTail: true,
+		runBrief: async () => {
+			throw new Error("offline");
+		},
+	});
+	assert.equal(f.status().state, "ready");
+});
