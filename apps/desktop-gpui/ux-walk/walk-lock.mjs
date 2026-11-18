@@ -14,11 +14,17 @@ const folders = {
 	processing: ".processing-lock",
 };
 const busy = (scope) =>
-	new Error(
-		scope === "processing"
-			? "This walk is already being processed, or its ownership socket is busy."
-			: "This recording already has a checkpoint operation, or its ownership socket is busy. Wait for evidence sync to finish.",
+	Object.assign(
+		new Error(
+			scope === "processing"
+				? "This walk is already being processed, or its ownership socket is busy."
+				: "This recording already has a checkpoint operation, or its ownership socket is busy. Wait for evidence sync to finish.",
+		),
+		{ code: "WALK_BUSY", scope },
 	);
+
+export const isWalkBusy = (error, scope) =>
+	error?.code === "WALK_BUSY" && error.scope === scope;
 
 function identity(directory, scope) {
 	if (!Object.hasOwn(folders, scope))

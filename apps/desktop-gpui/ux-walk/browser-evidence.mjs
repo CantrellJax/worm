@@ -164,6 +164,9 @@ export function sanitizeBrowserEvent(raw, receivedAt = Date.now()) {
 	return result;
 }
 
+const NOT_OWNED_WINDOW =
+	"The selected source is not the browser window opened for this walk";
+
 const unavailable = (reason = "not captured") => ({
 	events: [],
 	coverage: { dom: reason, network: reason, console: reason },
@@ -188,9 +191,12 @@ export function projectBrowserEvidence(file, journal) {
 		return unavailable("unavailable: browser collector metadata is unreadable");
 	}
 	if (metadata.state === "unavailable")
-		return unavailable(
-			`not captured: ${metadata.reason || "browser collector unavailable"}`,
-		);
+		return {
+			...unavailable(
+				`not captured: ${metadata.reason || "browser collector unavailable"}`,
+			),
+			ownedWindow: metadata.reason !== NOT_OWNED_WINDOW,
+		};
 	if (
 		metadata.schemaVersion !== 1 ||
 		!metadata.captureId ||

@@ -11,6 +11,7 @@ import {
 	finishNativeWalk,
 	nameWalkVoices,
 	nativeWalkPrompt,
+	retryWalkItems,
 	snapshotNativeWalk,
 } from "./native-walk.mjs";
 import { walkModeName } from "./walk-brand.mjs";
@@ -1945,4 +1946,167 @@ test("assign-project moves a recording between projects and out of them", (t) =>
 			.project,
 		null,
 	);
+});
+
+async function walkWithoutItems(t, { brief = true } = {}) {
+	const f = fixture(t);
+	f.journal.durationMs = 30000;
+	f.journal.events = f.journal.events.filter((event) => event.kind === "note");
+	f.save();
+	const cfg = { transcriber: "none", brief };
+	await finishNativeWalk(f.file, cfg, {
+		client: {
+			export: async (_project, output) => {
+				fs.writeFileSync(output, "export");
+				return { durationS: 30 };
+			},
+		},
+		clip: async (_input, output) => fs.writeFileSync(output, "clip"),
+		processChapter: async (directory) => {
+			fs.writeFileSync(
+				path.join(directory, "transcript.srt"),
+				"1\n00:00:00,000 --> 00:00:02,000\nThe button is clipped\n",
+			);
+			return { transcript: true };
+		},
+		writeIndex: () => {},
+		writeReport: () => {},
+	});
+	const read = (name) => fs.readFileSync(path.join(f.directory, name), "utf8");
+	return { ...f, cfg, read, status: () => JSON.parse(read("processing.json")) };
+}
+
+test("a walk whose brief produced no items says so in the report and offers a retry", async (t) => {
+	const f = await walkWithoutItems(t);
+	assert.equal(f.status().state, "ready");
+	assert.equal(f.status().items, "missing");
+	assert.match(f.read("report.html"), /No action items yet/);
+	assert.match(f.read("report.html"), /retry-items/);
+	const brief = async (directory) =>
+		fs.writeFileSync(
+			path.join(directory, "items.json"),
+			JSON.stringify({ items: [] }),
+		);
+	const failed = await retryWalkItems(f.file, f.cfg, {
+		runBrief: async () => {
+			throw new Error("claude is not signed in");
+		},
+	});
+	assert.deepEqual(failed.missing, ["01-walkthrough"]);
+	assert.equal(f.status().items, "missing");
+	assert.match(f.status().itemsError, /claude is not signed in/);
+	assert.match(f.read("report.html"), /claude is not signed in/);
+	const fixed = await retryWalkItems(f.file, f.cfg, { runBrief: brief });
+	assert.deepEqual(fixed.missing, []);
+	assert.equal(f.status().items, "ready");
+	assert.equal(f.status().itemsError, undefined);
+	assert.doesNotMatch(f.read("report.html"), /No action items yet/);
+});
+
+test("a reconcile that finds a ready walk without items runs the brief again", async (t) => {
+	const f = await walkWithoutItems(t);
+	let briefed = 0;
+	await finishNativeWalk(f.file, f.cfg, {
+		reconcileStopTail: true,
+		runBrief: async (directory) => {
+			briefed++;
+			fs.writeFileSync(
+				path.join(directory, "items.json"),
+				JSON.stringify({ items: [] }),
+			);
+		},
+	});
+	assert.equal(briefed, 1);
+	assert.equal(f.status().items, "ready");
+	assert.doesNotMatch(f.read("report.html"), /No action items yet/);
+});
+
+test("a walk without the brief setting reports no missing items", async (t) => {
+	const f = await walkWithoutItems(t, { brief: false });
+	assert.equal(f.status().items, undefined);
+	assert.doesNotMatch(f.read("report.html"), /No action items yet/);
+});
+
+test("the start page is not claimed when the recording is not the walk's browser window", async (t) => {
+	const f = fixture(t);
+	const run = () =>
+		finishNativeWalk(
+			f.file,
+			{ transcriber: "none", brief: false },
+			{
+				client: {
+					export: async (_project, output) => {
+						fs.writeFileSync(output, "export");
+						return { durationS: 10 };
+					},
+				},
+				clip: async (_input, output) => fs.writeFileSync(output, "clip"),
+				processChapter: async () => ({}),
+				writeIndex: () => {},
+				writeReport: () => {},
+			},
+		);
+	await run();
+	const read = (name) => fs.readFileSync(path.join(f.directory, name), "utf8");
+	assert.equal(JSON.parse(read("session.json")).url, "https://example.com/");
+	fs.writeFileSync(
+		path.join(f.directory, "browser-evidence.json"),
+		JSON.stringify({
+			schemaVersion: 1,
+			state: "unavailable",
+			reason:
+				"The selected source is not the browser window opened for this walk",
+		}),
+	);
+	fs.rmSync(path.join(f.directory, "processing.json"));
+	await run();
+	assert.equal(JSON.parse(read("session.json")).url, null);
+	assert.doesNotMatch(read("report.html"), /example\.com/);
+});
+
+test("a retry still runs for a walk marked missing after the brief setting is turned off", async (t) => {
+	const f = await walkWithoutItems(t);
+	assert.equal(f.status().items, "missing");
+	const result = await retryWalkItems(
+		f.file,
+		{ ...f.cfg, brief: false },
+		{
+			runBrief: async (directory) =>
+				fs.writeFileSync(
+					path.join(directory, "items.json"),
+					JSON.stringify({ items: [] }),
+				),
+		},
+	);
+	assert.deepEqual(result.missing, []);
+	assert.equal(f.status().items, "ready");
+});
+
+test("a report written before the notice existed gets it on retry", async (t) => {
+	const f = await walkWithoutItems(t);
+	fs.writeFileSync(
+		path.join(f.directory, "report.html"),
+		f
+			.read("report.html")
+			.replace(/<!--items-notice-->[\s\S]*?<!--\/items-notice-->/, ""),
+	);
+	await retryWalkItems(f.file, f.cfg, {
+		runBrief: async () => {
+			throw new Error("offline");
+		},
+	});
+	assert.match(f.read("report.html"), /No action items yet/);
+});
+
+test("a failing refresh does not demote a ready walk", async (t) => {
+	const f = await walkWithoutItems(t);
+	fs.rmSync(path.join(f.directory, "report.html"));
+	fs.mkdirSync(path.join(f.directory, "report.html"));
+	await finishNativeWalk(f.file, f.cfg, {
+		reconcileStopTail: true,
+		runBrief: async () => {
+			throw new Error("offline");
+		},
+	});
+	assert.equal(f.status().state, "ready");
 });
