@@ -16,7 +16,7 @@ import {
 import { scanFragmentedAudio } from "./fragmented-audio.mjs";
 import { sourceAudioProblem } from "./native-audio.mjs";
 import { RecoveryTransport } from "./recovery-transport.mjs";
-import { acquireWalkLock } from "./walk-lock.mjs";
+import { acquireWalkLock, isWalkBusy } from "./walk-lock.mjs";
 
 const local = new URL("./src/config.mjs", import.meta.url);
 const engine = fs.existsSync(local)
@@ -950,20 +950,32 @@ export async function runCheckpointWorker(file, cfg, dependencies = {}) {
 		readJson(file).state === "complete" &&
 		fs.existsSync(path.join(directory, "processing.json"))
 	) {
-		try {
-			const reconcile =
-				dependencies.reconcileReport ??
-				(await import("./native-walk.mjs")).finishNativeWalk;
-			await reconcile(file, cfg, {
-				reconcileStopTail: true,
-				reconcileWaitMs: dependencies.reconcileWaitMs,
-			});
-		} catch (error) {
-			durableJson(path.join(directory, `report-refresh-${randomUUID()}.json`), {
-				schemaVersion: 1,
-				error: String(error.message).slice(0, 500),
-				attemptedAt: Date.now(),
-			});
+		const retryUntil = Date.now() + (dependencies.reconcileRetryMs ?? 900000);
+		for (;;) {
+			try {
+				const reconcile =
+					dependencies.reconcileReport ??
+					(await import("./native-walk.mjs")).finishNativeWalk;
+				await reconcile(file, cfg, {
+					reconcileStopTail: true,
+					reconcileWaitMs: dependencies.reconcileWaitMs,
+				});
+				break;
+			} catch (error) {
+				if (isWalkBusy(error) && Date.now() < retryUntil) {
+					await pause(Math.min(1000, Math.max(0, retryUntil - Date.now())));
+					continue;
+				}
+				durableJson(
+					path.join(directory, `report-refresh-${randomUUID()}.json`),
+					{
+						schemaVersion: 1,
+						error: String(error.message).slice(0, 500),
+						attemptedAt: Date.now(),
+					},
+				);
+				break;
+			}
 		}
 	}
 }

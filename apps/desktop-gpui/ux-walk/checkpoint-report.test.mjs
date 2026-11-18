@@ -23,6 +23,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 for (const timing of [
 	"before",
 	"during",
+	"slow-owner",
 	"after",
 	"ambiguous",
 	"rejected",
@@ -150,6 +151,9 @@ for (const timing of [
 				fs.rmSync(root, { recursive: true, force: true });
 			});
 			worker = runCheckpointWorker(file, cfg, {
+				...(timing === "slow-owner"
+					? { reconcileWaitMs: 20, reconcileRetryMs: 10000 }
+					: {}),
 				...(timing === "handoff"
 					? {
 							reconcileReport: async () => {
@@ -193,7 +197,8 @@ for (const timing of [
 						exportCalls++;
 						exportEntered.release();
 						if (timing === "video-failed") throw Error("Video refused");
-						if (timing === "during") await exportGate.promise;
+						if (["during", "slow-owner"].includes(timing))
+							await exportGate.promise;
 						fs.copyFileSync(display, output);
 						return { durationS: 2 };
 					},
@@ -206,7 +211,7 @@ for (const timing of [
 					}),
 			});
 			await exportEntered.promise;
-			if (timing === "during") {
+			if (["during", "slow-owner"].includes(timing)) {
 				words.release();
 				const deadline = Date.now() + 5000;
 				while (!fs.existsSync(path.join(directory, "checkpoints/seal.json"))) {
@@ -216,6 +221,7 @@ for (const timing of [
 					);
 					await sleep(20);
 				}
+				if (timing === "slow-owner") await sleep(1500);
 				exportGate.release();
 			}
 			if (timing === "video-failed")
@@ -275,6 +281,13 @@ for (const timing of [
 				assert.ok(Date.now() - began < 1000);
 				assert.deepEqual(fs.readFileSync(processingFile), before);
 			}
+			if (timing === "slow-owner")
+				assert.deepEqual(
+					fs
+						.readdirSync(directory)
+						.filter((name) => /^report-refresh-.*\.json$/.test(name)),
+					[],
+				);
 			if (timing === "handoff") {
 				assert.deepEqual(
 					JSON.parse(
@@ -394,6 +407,7 @@ for (const slowVideo of [false, true])
 			};
 			worker = runCheckpointWorker(file, cfg, {
 				reconcileWaitMs: slowVideo ? 20 : 150000,
+				...(slowVideo ? { reconcileRetryMs: 0 } : {}),
 				reconcileReport: (file, cfg, options) =>
 					finishNativeWalk(file, cfg, { ...dependencies, ...options }),
 				transport: {

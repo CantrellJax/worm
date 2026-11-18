@@ -188,9 +188,12 @@ export function projectBrowserEvidence(file, journal) {
 		return unavailable("unavailable: browser collector metadata is unreadable");
 	}
 	if (metadata.state === "unavailable")
-		return unavailable(
-			`not captured: ${metadata.reason || "browser collector unavailable"}`,
-		);
+		return {
+			...unavailable(
+				`not captured: ${metadata.reason || "browser collector unavailable"}`,
+			),
+			ownedWindow: false,
+		};
 	if (
 		metadata.schemaVersion !== 1 ||
 		!metadata.captureId ||

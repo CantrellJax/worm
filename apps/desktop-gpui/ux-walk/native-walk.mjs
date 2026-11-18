@@ -36,6 +36,7 @@ const { chapterName, DIATRIBE_ASK, handoffAsk, handoffContext } = await import(
 );
 const { loadConfig } = await import(new URL("config.mjs", engine));
 const { bodySummary, isFailed } = await import(new URL("timeline.mjs", engine));
+const { runBrief } = await import(new URL("brief.mjs", engine));
 const run = promisify(execFile);
 const quote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
 const engineCli = () =>
@@ -417,7 +418,98 @@ export async function nameWalkVoices(
 	}
 }
 
-function writeNativeReport(directory, session, journal, browser) {
+const ITEMS_MARKER = /<!--items-notice-->[\s\S]*?<!--\/items-notice-->/;
+const MIN_BRIEF_S = 20;
+
+const retryItemsCommand = (file) =>
+	`${quote(process.execPath)} ${quote(fileURLToPath(import.meta.url))} retry-items ${quote(file)}`;
+
+function chaptersMissingItems(directory, journal, cfg) {
+	if (!(isDiatribe(journal) || cfg.brief === true)) return [];
+	let chapters;
+	try {
+		chapters = JSON.parse(
+			fs.readFileSync(path.join(directory, "session.json"), "utf8"),
+		).chapters;
+	} catch {
+		return [];
+	}
+	return (Array.isArray(chapters) ? chapters : []).filter((chapter) => {
+		const transcript = path.join(directory, chapter.dir, "transcript.srt");
+		return (
+			chapter.status === "ready" &&
+			(chapter.endMs - chapter.startMs) / 1000 >= MIN_BRIEF_S &&
+			fs.existsSync(transcript) &&
+			fs.statSync(transcript).size > 0 &&
+			!fs.existsSync(path.join(directory, chapter.dir, "items.json"))
+		);
+	});
+}
+
+function itemsNotice(file, missing, error) {
+	if (!missing.length) return "<!--items-notice--><!--/items-notice-->";
+	return `<!--items-notice--><section class="notice"><h2>No action items yet</h2><p>The transcript is saved, but the notes and action items for ${missing.map((chapter) => escapeHTML(chapter.name)).join(", ")} could not be extracted${error ? `: ${escapeHTML(error)}` : ""}. Retry with <code>${escapeHTML(retryItemsCommand(file))}</code></p></section><!--/items-notice-->`;
+}
+
+async function refreshItems(file, cfg, { retry, dependencies = {} }) {
+	const journal = readJournal(file);
+	const directory = journal.request.directory;
+	let missing = chaptersMissingItems(directory, journal, cfg);
+	const failures = [];
+	if (retry) {
+		for (const chapter of missing) {
+			try {
+				await (dependencies.runBrief ?? runBrief)(
+					path.join(directory, chapter.dir),
+					cfg,
+				);
+			} catch (error) {
+				failures.push(`${chapter.name}: ${error.message}`);
+			}
+		}
+		missing = chaptersMissingItems(directory, journal, cfg);
+	}
+	const error = failures.join("; ").slice(0, 500) || null;
+	const status = path.join(directory, "processing.json");
+	let state;
+	try {
+		state = JSON.parse(fs.readFileSync(status, "utf8"));
+	} catch {}
+	if (state) {
+		const { itemsError: _dropped, ...rest } = state;
+		save(status, {
+			...rest,
+			items: missing.length ? "missing" : "ready",
+			...(missing.length && error ? { itemsError: error } : {}),
+		});
+	}
+	const report = path.join(directory, "report.html");
+	if (fs.existsSync(report)) {
+		const html = fs.readFileSync(report, "utf8");
+		if (ITEMS_MARKER.test(html))
+			fs.writeFileSync(
+				report,
+				html.replace(ITEMS_MARKER, () => itemsNotice(file, missing, error)),
+				{ mode: 0o600 },
+			);
+	}
+	return { missing: missing.map((chapter) => chapter.dir), error };
+}
+
+export async function retryWalkItems(file, loaded, dependencies = {}) {
+	const journal = readJournal(file);
+	const { cfg } = withRecordingProject(journal, loaded);
+	const lease = await acquireWalkLock(journal.request.directory, "processing", {
+		waitMs: dependencies.waitMs ?? 0,
+	});
+	try {
+		return await refreshItems(file, cfg, { retry: true, dependencies });
+	} finally {
+		await lease.release();
+	}
+}
+
+function writeNativeReport(directory, session, journal, browser, notice = "") {
 	const modeName = isDiatribe(journal) ? notesName(journal) : walkModeName;
 	const report = path.join(directory, "report.html");
 	if (fs.existsSync(report))
@@ -489,7 +581,7 @@ function writeNativeReport(directory, session, journal, browser) {
 		.join("");
 	fs.writeFileSync(
 		report,
-		`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHTML(session.topic)} · ${escapeHTML(modeName)}</title><style>body{font:16px system-ui;color:#20242c;background:#fafaf9;max-width:960px;margin:48px auto;padding:0 24px;line-height:1.6}h1{font-size:32px;line-height:1.2}h2{margin-top:40px}video{width:100%;border-radius:12px;background:#15171c}a{color:#2467d5}time{color:#666;font-variant-numeric:tabular-nums;margin-right:12px}li{margin:12px 0;overflow-wrap:anywhere}.meta{color:#666;font-size:14px}</style><p class="meta">${escapeHTML(modeName)}</p><h1>${escapeHTML(session.topic)}</h1><p class="meta">${escapeHTML(session.startedAt)}${session.url ? ` · ${escapeHTML(session.url)}` : ""}</p><p class="meta" id="voices">${voiceLegend(directory)}</p><h2>Notes</h2>${notes ? `<ul>${notes}</ul>` : "<p>No notes added.</p>"}${chapters}${browserDetails ? `<h2>Browser evidence</h2><ul>${browserDetails}</ul><p>${browserLinks}</p>` : ""}${findings ? `<h3>Console and failed requests</h3><ul>${findings}</ul><p class="meta">Up to 200 observations shown. The timeline and action log retain the full captured evidence.</p>` : ""}<h2>Capture details</h2><p class="meta">Recorded locally. Notes, chapters and browser events use the recorder’s elapsed time, excluding pauses; first-frame alignment is approximate.</p><p><a href="media/video.mp4">Full recording</a> · <a href="native-walk.json">Saved journal</a> · <a href="session.json">Session</a></p></html>`,
+		`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHTML(session.topic)} · ${escapeHTML(modeName)}</title><style>body{font:16px system-ui;color:#20242c;background:#fafaf9;max-width:960px;margin:48px auto;padding:0 24px;line-height:1.6}h1{font-size:32px;line-height:1.2}h2{margin-top:40px}video{width:100%;border-radius:12px;background:#15171c}a{color:#2467d5}.notice{border-left:4px solid #c2410c;background:#fff4ec;padding:4px 16px;border-radius:6px}code{overflow-wrap:anywhere;font-size:13px}time{color:#666;font-variant-numeric:tabular-nums;margin-right:12px}li{margin:12px 0;overflow-wrap:anywhere}.meta{color:#666;font-size:14px}</style><p class="meta">${escapeHTML(modeName)}</p><h1>${escapeHTML(session.topic)}</h1><p class="meta">${escapeHTML(session.startedAt)}${session.url ? ` · ${escapeHTML(session.url)}` : ""}</p><p class="meta" id="voices">${voiceLegend(directory)}</p>${notice}<h2>Notes</h2>${notes ? `<ul>${notes}</ul>` : "<p>No notes added.</p>"}${chapters}${browserDetails ? `<h2>Browser evidence</h2><ul>${browserDetails}</ul><p>${browserLinks}</p>` : ""}${findings ? `<h3>Console and failed requests</h3><ul>${findings}</ul><p class="meta">Up to 200 observations shown. The timeline and action log retain the full captured evidence.</p>` : ""}<h2>Capture details</h2><p class="meta">Recorded locally. Notes, chapters and browser events use the recorder’s elapsed time, excluding pauses; first-frame alignment is approximate.</p><p><a href="media/video.mp4">Full recording</a> · <a href="native-walk.json">Saved journal</a> · <a href="session.json">Session</a></p></html>`,
 		{ mode: 0o600 },
 	);
 }
@@ -527,8 +619,11 @@ export async function finishNativeWalk(file, loaded, dependencies = {}) {
 				!previous ||
 				!["ready", "processing"].includes(previous.state) ||
 				(previous.state === "ready" && previous.transcript !== "partial")
-			)
+			) {
+				if (previous?.state === "ready")
+					await refreshItems(file, cfg, { retry: true, dependencies });
 				return directory;
+			}
 			if (
 				!fs.existsSync(path.join(directory, "media/video.mp4")) ||
 				!fs.existsSync(path.join(directory, "media/export.json"))
@@ -558,7 +653,10 @@ export async function finishNativeWalk(file, loaded, dependencies = {}) {
 			: projectBrowserEvidence(file, journal);
 		const session = {
 			topic: journal.request.topic,
-			url: diatribe ? null : safeBrowserUrl(journal.request.url),
+			url:
+				diatribe || browser.ownedWindow === false
+					? null
+					: safeBrowserUrl(journal.request.url),
 			kind: diatribe ? DIATRIBE : "native-cap",
 			dir: directory,
 			startedAt: new Date(journal.startedAtMs).toISOString(),
@@ -1043,7 +1141,14 @@ export async function finishNativeWalk(file, loaded, dependencies = {}) {
 		save(path.join(directory, "session.json"), session);
 		(dependencies.writeIndex ?? processing.writeIndex)(directory);
 		(dependencies.writeReport ?? writeReport)(directory);
-		writeNativeReport(directory, session, journal, browser);
+		const missingItems = chaptersMissingItems(directory, journal, cfg);
+		writeNativeReport(
+			directory,
+			session,
+			journal,
+			browser,
+			itemsNotice(file, missingItems, null),
+		);
 		fs.writeFileSync(
 			path.join(directory, "agent-prompt.txt"),
 			`${nativeWalkPrompt(file, { prepared: true, cfg })}\n`,
@@ -1106,6 +1211,9 @@ export async function finishNativeWalk(file, loaded, dependencies = {}) {
 										? "failed"
 										: "unavailable",
 					}),
+			...(isDiatribe(journal) || cfg.brief === true
+				? { items: missingItems.length ? "missing" : "ready" }
+				: {}),
 			reportReadyAt: new Date().toISOString(),
 		});
 		return directory;
@@ -1495,7 +1603,11 @@ if (isMainModule()) {
 	const [command, file] = process.argv.slice(2);
 	try {
 		if (command === "snapshot") snapshotNativeWalk(file);
-		else if (command === "process" || command === "process-full-transcript") {
+		else if (command === "retry-items") {
+			const result = await retryWalkItems(file, loadConfig());
+			console.log(JSON.stringify(result));
+			if (result.missing.length) process.exitCode = 3;
+		} else if (command === "process" || command === "process-full-transcript") {
 			await finishNativeWalk(file, loadConfig(), {
 				fullTranscription: command === "process-full-transcript",
 			});
@@ -1613,7 +1725,7 @@ if (isMainModule()) {
 			);
 		} else
 			throw new Error(
-				"Usage: native-walk.mjs snapshot|process|handoff|handoff-ask|items|file|glossary-suggestions|glossary-accept|glossary-reject|assign-project <file>, or projects|trackers|save-project|delete-project|targets",
+				"Usage: native-walk.mjs snapshot|process|retry-items|handoff|handoff-ask|items|file|glossary-suggestions|glossary-accept|glossary-reject|assign-project <file>, or projects|trackers|save-project|delete-project|targets",
 			);
 	} catch (error) {
 		console.error(error.message);
