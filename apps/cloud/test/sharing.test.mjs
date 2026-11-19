@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
+import vm from "node:vm";
 import { convertV4MiniflareOptions, Miniflare } from "miniflare";
 
 let runtime;
@@ -315,6 +316,89 @@ test("viewer preserves the share path and serves the viewer without a redirect",
 	assert.match(page, /Opening shared recording/);
 	assert.match(page, new RegExp(`Shared with ${brand.display_name}`));
 	assert.doesNotMatch(page, /%app%/);
+});
+
+test("a share link that picked up trailing punctuation redirects to the clean viewer path", async () => {
+	const id = "00000000-0000-0000-0000-000000000000";
+	for (const tail of [
+		"%5D",
+		"]",
+		")",
+		"].",
+		"%5D.",
+		"%5D%2E",
+		".,",
+		"%29%3B",
+	]) {
+		const result = await request(`/s/${id}${tail}`, { redirect: "manual" });
+		assert.equal(result.status, 302, tail);
+		assert.equal(result.headers.get("Location"), `/s/${id}`, tail);
+	}
+	for (const path of [
+		`/s/${id}x`,
+		`/s/${id.slice(1)}%5D`,
+		"/s/%5D",
+		`/s/${id}/%5D`,
+	]) {
+		const result = await request(path, { redirect: "manual" });
+		assert.equal(result.status === 302, false, path);
+		assert.equal(result.headers.get("Location"), null, path);
+	}
+});
+
+test("the viewer card is generic: no share's title or existence reaches a request without the key", async () => {
+	const share = await create(new Uint8Array([1, 2, 3]), {
+		title: "Private quarterly numbers",
+	});
+	const real = await (await request(`/s/${share.id}`)).text();
+	const unknown = await (
+		await request("/s/00000000-0000-0000-0000-000000000000")
+	).text();
+	assert.equal(real, unknown);
+	assert.doesNotMatch(real, /Private quarterly numbers/);
+	assert.match(real, /<meta property="og:title" content="Shared recording">/);
+	assert.match(real, /<meta property="og:description" content="[^"]+">/);
+	assert.match(real, /<meta property="og:type" content="website">/);
+	assert.match(
+		real,
+		/<meta name="twitter:card" content="summary_large_image">/,
+	);
+	assert.match(real, /<meta name="description" content="[^"]+">/);
+	assert.match(
+		real,
+		/<meta property="og:image" content="https:\/\/sharing\.test\/card\.png">/,
+	);
+	assert.doesNotMatch(real, /%origin%/);
+	const image = await request("/card.png");
+	assert.equal(image.status, 200);
+	assert.equal(image.headers.get("Content-Type"), "image/png");
+	const bytes = new Uint8Array(await image.arrayBuffer());
+	assert.deepEqual([...bytes.slice(1, 4)], [0x50, 0x4e, 0x47]);
+});
+
+test("the viewer script drops stray characters from the id and the key before using them", async () => {
+	const id = "11111111-2222-3333-4444-555555555555";
+	const key = "a1b2c3";
+	const calls = [];
+	const done = new Promise((resolve) => {
+		const fetch = async (url, init) => {
+			calls.push({ url, auth: init?.headers?.Authorization });
+			resolve();
+			return { ok: false };
+		};
+		const element = () => ({ textContent: "", hidden: true });
+		vm.runInNewContext(
+			readFileSync(new URL("../public/viewer.js", import.meta.url), "utf8"),
+			{
+				location: { pathname: `/s/${id}%5D`, hash: `#${key}%5D.` },
+				document: { title: "", getElementById: element },
+				fetch,
+			},
+		);
+	});
+	await done;
+	assert.equal(calls[0].url, `/api/v1/shares/${id}/access`);
+	assert.equal(calls[0].auth, `Bearer ${key}`);
 });
 
 test("the cloud home page works with exact HTML asset routing", async () => {

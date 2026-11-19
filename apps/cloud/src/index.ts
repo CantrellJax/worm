@@ -8,6 +8,7 @@ import {
 	HttpError,
 	hash,
 	response,
+	trimStray,
 } from "./shared";
 
 type RuntimeEnv = Env & { UPLOAD_TOKEN?: string; FEEDBACK_SITES?: string };
@@ -36,6 +37,7 @@ const REWIND_CSP =
 const rewindPage = (pathname: string) =>
 	pathname.startsWith("/rewind/") &&
 	FEEDBACK_ID.test(pathname.slice("/rewind/".length));
+const VIEWER_PATH = /^\/s\/[a-f0-9-]{36}$/;
 const TYPES = new Set(["video/mp4", "image/png", "image/jpeg"]);
 
 async function owner(request: Request, env: RuntimeEnv): Promise<string> {
@@ -331,7 +333,13 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 		throw new HttpError(405, "Method not allowed.");
 	}
 	if (url.pathname.startsWith("/api/")) throw new HttpError(404, "Not found.");
-	if (/^\/s\/[a-f0-9-]{36}$/.test(url.pathname)) url.pathname = "/viewer.html";
+	const cleanPath = trimStray(url.pathname);
+	if (cleanPath !== url.pathname && VIEWER_PATH.test(cleanPath))
+		return new Response(null, {
+			status: 302,
+			headers: { Location: cleanPath },
+		});
+	if (VIEWER_PATH.test(url.pathname)) url.pathname = "/viewer.html";
 	if (rewindPage(url.pathname)) url.pathname = "/rewind.html";
 	if (url.pathname === "/") url.pathname = "/index.html";
 	const asset = await env.ASSETS.fetch(new Request(url, request));
@@ -342,7 +350,8 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 	return new Response(
 		(await asset.text())
 			.replaceAll("%app%", brand.display_name)
-			.replaceAll("%repo%", brand.repo_url),
+			.replaceAll("%repo%", brand.repo_url)
+			.replaceAll("%origin%", url.origin),
 		{ status: asset.status, headers },
 	);
 }

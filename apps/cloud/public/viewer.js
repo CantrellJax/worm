@@ -1,7 +1,27 @@
+const STRAY = new Set("])}>.,;:!?'\"");
+
+// Same rule as trimStray in src/shared.ts: a message app can glue closing
+// punctuation onto a pasted link, which the fragment never lets the server fix.
+function trimStray(value) {
+	let end = value.length;
+	for (;;) {
+		if (end > 0 && STRAY.has(value[end - 1])) {
+			end -= 1;
+			continue;
+		}
+		const encoded = /%([0-9a-fA-F]{2})$/.exec(value.slice(0, end));
+		if (encoded && STRAY.has(String.fromCharCode(Number(`0x${encoded[1]}`)))) {
+			end -= 3;
+			continue;
+		}
+		return value.slice(0, end);
+	}
+}
+
 async function openShare() {
-	const id = location.pathname.split("/").at(-1);
+	const id = trimStray(location.pathname).split("/").at(-1);
 	const base = `/api/v1/shares/${id}`;
-	const token = location.hash.slice(1);
+	const token = trimStray(location.hash.slice(1));
 	if (token) {
 		const access = await fetch(`${base}/access`, {
 			method: "POST",

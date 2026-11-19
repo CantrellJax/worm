@@ -9,6 +9,26 @@ export class HttpError extends Error {
 	}
 }
 
+const STRAY = new Set("])}>.,;:!?'\"");
+
+// A message app can glue closing punctuation onto a pasted link, as a literal
+// character or percent-encoded (%5D); the share id and key never contain these.
+export function trimStray(value: string): string {
+	let end = value.length;
+	for (;;) {
+		if (end > 0 && STRAY.has(value[end - 1])) {
+			end -= 1;
+			continue;
+		}
+		const encoded = /%([0-9a-fA-F]{2})$/.exec(value.slice(0, end));
+		if (encoded && STRAY.has(String.fromCharCode(Number(`0x${encoded[1]}`)))) {
+			end -= 3;
+			continue;
+		}
+		return value.slice(0, end);
+	}
+}
+
 export function response(body: unknown, status = 200): Response {
 	return Response.json(body, { status });
 }
