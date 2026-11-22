@@ -47,6 +47,17 @@ async function openShare() {
 		share.contentType === "video/mp4" ? "video" : "image",
 	);
 	element.src = `${base}/media`;
+	if (share.captions && share.contentType === "video/mp4") {
+		const track = document.createElement("track");
+		Object.assign(track, {
+			kind: "captions",
+			label: "English",
+			srclang: "en",
+			src: `${base}/captions`,
+			default: true,
+		});
+		element.append(track);
+	}
 	element.hidden = false;
 }
 openShare().catch((error) => {

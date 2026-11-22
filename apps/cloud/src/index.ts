@@ -26,6 +26,7 @@ interface Share {
 }
 
 const PART_SIZE = 8 * 1024 * 1024;
+const CAPTIONS_LIMIT = 256 * 1024;
 const CSP =
 	"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 // The rrweb replay rebuilds the recorded page in a sandboxed iframe with the
@@ -221,6 +222,48 @@ async function media(
 	);
 }
 
+async function putCaptions(
+	request: Request,
+	env: RuntimeEnv,
+	share: Share,
+): Promise<Response> {
+	if (!share.ready || share.contentType !== "video/mp4")
+		throw new HttpError(409, "Captions need a published video.");
+	const bytes = await boundedBody(request, CAPTIONS_LIMIT);
+	let text: string;
+	try {
+		text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+			bytes,
+		);
+	} catch {
+		throw new HttpError(400, "Captions must be UTF-8 WebVTT.");
+	}
+	if (!/^\uFEFF?WEBVTT(?:[ \t\r\n]|$)/.test(text))
+		throw new HttpError(400, "Captions must be UTF-8 WebVTT.");
+	await env.MEDIA.put(`captions/${share.id}`, bytes, {
+		httpMetadata: { contentType: "text/vtt; charset=utf-8" },
+	});
+	// A revoke that landed while the body streamed has already deleted captions/ID.
+	if (await env.MEDIA.head(`revoked/${share.id}`)) {
+		await env.MEDIA.delete(`captions/${share.id}`);
+		throw new HttpError(404, "Share unavailable.");
+	}
+	return new Response(null, { status: 204 });
+}
+
+async function captions(
+	request: Request,
+	env: RuntimeEnv,
+	share: Share,
+): Promise<Response> {
+	await readable(request, share);
+	const object = await env.MEDIA.get(`captions/${share.id}`);
+	if (!object) throw new HttpError(404, "Share unavailable.");
+	return new Response(object.body, {
+		headers: { "Content-Type": "text/vtt; charset=utf-8" },
+	});
+}
+
 async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 	const url = new URL(request.url);
 	if (
@@ -238,19 +281,24 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 	if (url.pathname === "/api/v1/shares" && request.method === "POST")
 		return create(request, env);
 	const match =
-		/^\/api\/v1\/shares\/([a-f0-9-]{36})(?:\/(access|media|metadata|complete|parts\/(\d+)))?$/.exec(
+		/^\/api\/v1\/shares\/([a-f0-9-]{36})(?:\/(access|media|metadata|captions|complete|parts\/(\d+)))?$/.exec(
 			url.pathname,
 		);
 	if (match) {
 		const [, id, action, part] = match;
 		const writing =
 			request.method === "DELETE" ||
+			(request.method === "PUT" && action === "captions") ||
 			action === "complete" ||
 			part !== undefined;
 		const ownerId = writing ? await owner(request, env) : undefined;
 		const share = await load(env, id);
 		if (ownerId && !(await equal(ownerId, share.owner)))
 			throw new HttpError(404, "Share unavailable.");
+		if (request.method === "DELETE" && action === "captions") {
+			await env.MEDIA.delete(`captions/${id}`);
+			return new Response(null, { status: 204 });
+		}
 		if (request.method === "DELETE" && !action) {
 			await env.MEDIA.put(`revoked/${id}`, "revoked");
 			if (!share.ready)
@@ -258,9 +306,13 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 					`media/${id}`,
 					share.uploadId,
 				).abort();
-			await env.MEDIA.delete(`media/${id}`);
+			await env.MEDIA.delete([`media/${id}`, `captions/${id}`]);
 			return new Response(null, { status: 204 });
 		}
+		if (request.method === "PUT" && action === "captions")
+			return putCaptions(request, env, share);
+		if (request.method === "GET" && action === "captions")
+			return captions(request, env, share);
 		if (request.method === "PUT" && part) {
 			if (share.ready) throw new HttpError(409, "Share already published.");
 			const number = Number(part);
@@ -328,6 +380,7 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 				contentType: share.contentType,
 				size: share.size,
 				expiresAt: share.expiresAt,
+				captions: !!(await env.MEDIA.head(`captions/${id}`)),
 			});
 		}
 		throw new HttpError(405, "Method not allowed.");
