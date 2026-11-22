@@ -27,6 +27,7 @@ interface Share {
 
 const PART_SIZE = 8 * 1024 * 1024;
 const CAPTIONS_LIMIT = 256 * 1024;
+const CARD_LIMIT = 2 * 1024 * 1024;
 const CSP =
 	"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 // The rrweb replay rebuilds the recorded page in a sandboxed iframe with the
@@ -38,7 +39,8 @@ const REWIND_CSP =
 const rewindPage = (pathname: string) =>
 	pathname.startsWith("/rewind/") &&
 	FEEDBACK_ID.test(pathname.slice("/rewind/".length));
-const VIEWER_PATH = /^\/s\/[a-f0-9-]{36}$/;
+const VIEWER_PATH = /^\/s\/([a-f0-9-]{36})$/;
+const CARD_PATH = /^\/s\/([a-f0-9-]{36})\/card$/;
 const TYPES = new Set(["video/mp4", "image/png", "image/jpeg"]);
 
 async function owner(request: Request, env: RuntimeEnv): Promise<string> {
@@ -264,6 +266,118 @@ async function captions(
 	});
 }
 
+function cardType(bytes: Uint8Array): string | undefined {
+	const starts = (magic: number[]) =>
+		bytes.length >= magic.length && magic.every((byte, i) => bytes[i] === byte);
+	if (starts([0xff, 0xd8, 0xff])) return "image/jpeg";
+	if (starts([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+		return "image/png";
+}
+
+async function putCard(
+	request: Request,
+	env: RuntimeEnv,
+	share: Share,
+): Promise<Response> {
+	if (!share.ready)
+		throw new HttpError(409, "A preview card needs a published share.");
+	const bytes = await boundedBody(request, CARD_LIMIT);
+	const type = cardType(bytes);
+	if (!type)
+		throw new HttpError(400, "A preview card must be a JPEG or PNG image.");
+	await env.MEDIA.put(`cards/${share.id}`, bytes, {
+		httpMetadata: { contentType: type },
+	});
+	// A revoke that landed while the body streamed has already deleted cards/ID.
+	if (await env.MEDIA.head(`revoked/${share.id}`)) {
+		await env.MEDIA.delete(`cards/${share.id}`);
+		throw new HttpError(404, "Share unavailable.");
+	}
+	return new Response(null, { status: 204 });
+}
+
+async function liveCard(
+	env: RuntimeEnv,
+	id: string,
+): Promise<{ share: Share; type: string } | undefined> {
+	try {
+		const share = await load(env, id);
+		const type = share.ready
+			? (await env.MEDIA.head(`cards/${id}`))?.httpMetadata?.contentType
+			: undefined;
+		return type ? { share, type } : undefined;
+	} catch (error) {
+		if (error instanceof HttpError) return;
+		throw error;
+	}
+}
+
+async function cardImage(
+	request: Request,
+	env: RuntimeEnv,
+	id: string,
+): Promise<Response> {
+	if (!(await liveCard(env, id)))
+		throw new HttpError(404, "Share unavailable.");
+	const object =
+		request.method === "HEAD"
+			? await env.MEDIA.head(`cards/${id}`)
+			: await env.MEDIA.get(`cards/${id}`);
+	if (!object) throw new HttpError(404, "Share unavailable.");
+	return new Response(
+		"body" in object && object.body instanceof ReadableStream
+			? object.body
+			: null,
+		{
+			headers: {
+				"Content-Type": object.httpMetadata?.contentType ?? "image/jpeg",
+				"Content-Length": `${object.size}`,
+			},
+		},
+	);
+}
+
+function withCard(
+	page: Response,
+	origin: string,
+	id: string,
+	card: { share: Share; type: string },
+): Response {
+	// The rewriter only escapes quotes in attribute values, so `&` would be read
+	// back as the start of an entity.
+	const escaped = (value: string) =>
+		value
+			.replaceAll("&", "&amp;")
+			.replaceAll('"', "&quot;")
+			.replaceAll("<", "&lt;")
+			.replaceAll(">", "&gt;");
+	const content = (value: string) => ({
+		element(element: Element) {
+			element.setAttribute("content", escaped(value));
+		},
+	});
+	const drop = {
+		element(element: Element) {
+			element.remove();
+		},
+	};
+	const image = `${origin}/s/${id}/card`;
+	return new HTMLRewriter()
+		.on("title", {
+			element(element) {
+				element.setInnerContent(card.share.title);
+			},
+		})
+		.on('meta[property="og:title"]', content(card.share.title))
+		.on('meta[name="twitter:title"]', content(card.share.title))
+		.on('meta[property="og:image"]', content(image))
+		.on('meta[name="twitter:image"]', content(image))
+		.on('meta[property="og:image:type"]', content(card.type))
+		.on('meta[property="og:image:width"]', drop)
+		.on('meta[property="og:image:height"]', drop)
+		.transform(page);
+}
+
 async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 	const url = new URL(request.url);
 	if (
@@ -281,14 +395,15 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 	if (url.pathname === "/api/v1/shares" && request.method === "POST")
 		return create(request, env);
 	const match =
-		/^\/api\/v1\/shares\/([a-f0-9-]{36})(?:\/(access|media|metadata|captions|complete|parts\/(\d+)))?$/.exec(
+		/^\/api\/v1\/shares\/([a-f0-9-]{36})(?:\/(access|media|metadata|captions|card|complete|parts\/(\d+)))?$/.exec(
 			url.pathname,
 		);
 	if (match) {
 		const [, id, action, part] = match;
 		const writing =
 			request.method === "DELETE" ||
-			(request.method === "PUT" && action === "captions") ||
+			(request.method === "PUT" &&
+				(action === "captions" || action === "card")) ||
 			action === "complete" ||
 			part !== undefined;
 		const ownerId = writing ? await owner(request, env) : undefined;
@@ -299,6 +414,10 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 			await env.MEDIA.delete(`captions/${id}`);
 			return new Response(null, { status: 204 });
 		}
+		if (request.method === "DELETE" && action === "card") {
+			await env.MEDIA.delete(`cards/${id}`);
+			return new Response(null, { status: 204 });
+		}
 		if (request.method === "DELETE" && !action) {
 			await env.MEDIA.put(`revoked/${id}`, "revoked");
 			if (!share.ready)
@@ -306,11 +425,13 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 					`media/${id}`,
 					share.uploadId,
 				).abort();
-			await env.MEDIA.delete([`media/${id}`, `captions/${id}`]);
+			await env.MEDIA.delete([`media/${id}`, `captions/${id}`, `cards/${id}`]);
 			return new Response(null, { status: 204 });
 		}
 		if (request.method === "PUT" && action === "captions")
 			return putCaptions(request, env, share);
+		if (request.method === "PUT" && action === "card")
+			return putCard(request, env, share);
 		if (request.method === "GET" && action === "captions")
 			return captions(request, env, share);
 		if (request.method === "PUT" && part) {
@@ -381,18 +502,23 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 				size: share.size,
 				expiresAt: share.expiresAt,
 				captions: !!(await env.MEDIA.head(`captions/${id}`)),
+				card: !!(await env.MEDIA.head(`cards/${id}`)),
 			});
 		}
 		throw new HttpError(405, "Method not allowed.");
 	}
 	if (url.pathname.startsWith("/api/")) throw new HttpError(404, "Not found.");
+	const cardMatch = CARD_PATH.exec(url.pathname);
+	if (cardMatch && ["GET", "HEAD"].includes(request.method))
+		return cardImage(request, env, cardMatch[1]);
 	const cleanPath = trimStray(url.pathname);
 	if (cleanPath !== url.pathname && VIEWER_PATH.test(cleanPath))
 		return new Response(null, {
 			status: 302,
 			headers: { Location: cleanPath },
 		});
-	if (VIEWER_PATH.test(url.pathname)) url.pathname = "/viewer.html";
+	const viewerId = VIEWER_PATH.exec(url.pathname)?.[1];
+	if (viewerId) url.pathname = "/viewer.html";
 	if (rewindPage(url.pathname)) url.pathname = "/rewind.html";
 	if (url.pathname === "/") url.pathname = "/index.html";
 	const asset = await env.ASSETS.fetch(new Request(url, request));
@@ -400,13 +526,15 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 	const headers = new Headers(asset.headers);
 	headers.delete("content-length");
 	headers.delete("etag");
-	return new Response(
+	const page = new Response(
 		(await asset.text())
 			.replaceAll("%app%", brand.display_name)
 			.replaceAll("%repo%", brand.repo_url)
 			.replaceAll("%origin%", url.origin),
 		{ status: asset.status, headers },
 	);
+	const card = viewerId ? await liveCard(env, viewerId) : undefined;
+	return viewerId && card ? withCard(page, url.origin, viewerId, card) : page;
 }
 
 export default {

@@ -49,18 +49,22 @@ All JSON is bounded. Writes require `Authorization: Bearer <owner-upload-credent
 | PUT /api/v1/shares/ID/parts/N | Upload exactly the declared part size (final part can be smaller); return partNumber and etag |
 | POST /api/v1/shares/ID/complete | Accept ordered parts; validate final size before publishing |
 | DELETE /api/v1/shares/ID | Revoke access and remove the published media or abort an incomplete upload |
-| GET /api/v1/shares/ID/metadata | Read title, size, content type, expiry and whether captions exist with a read capability |
+| GET /api/v1/shares/ID/metadata | Read title, size, content type, expiry and whether captions and a card exist with a read capability |
 | PUT /api/v1/shares/ID/captions | Owner: store WebVTT captions (UTF-8, starting `WEBVTT`, at most 256 KiB) for a published video; replaces any earlier ones. DELETE removes them |
 | GET /api/v1/shares/ID/captions | Captions as `text/vtt` with the same bearer or cookie read access as the viewer. The `?token=` link and cross-origin playback that `/media` allows are not supported for captions. The viewer adds them as a `<track kind="captions">` when metadata says `captions: true` |
+| PUT /api/v1/shares/ID/card | Owner: store a preview card (JPEG or PNG by file signature, at most 2 MiB) for a published share; replaces any earlier one. DELETE removes it. Revoking removes it too |
+| GET or HEAD /s/ID/card | The card image, with no credential, while the share is live and has a card. Unknown, uncarded, expired and revoked shares all get the same 404 |
 | GET or HEAD /api/v1/shares/ID/media | Authorized media; single byte ranges supported. Also accepts `?token=READ_TOKEN` for a cross-origin `<video src>` |
 | POST /api/v1/shares/ID/access | Exchange the read capability for a scoped HttpOnly playback cookie bounded by link expiry |
-| GET /s/ID#READ_CAPABILITY | Viewer; the fragment is exchanged for playback access and never sent in the HTTP URL |
+| GET /s/ID#READ_CAPABILITY | Viewer; the fragment is exchanged for playback access and never sent in the HTTP URL. Without a card its link preview is generic; with one it shows the share's title and card |
 | POST /api/v1/feedback | Multipart report (`key`, `note`, `evidence`, optional `screenshot` and `voice`) from a configured origin; returns its id |
 | GET /api/v1/feedback | Owner: list reports, newest first (`cursor` pages) |
 | GET /api/v1/feedback/ID | Owner: the report with its evidence |
 | GET /api/v1/feedback/ID/screenshot, /voice or /rewind | Owner: the attachment, with its SHA-256 in `X-Content-SHA256` (the rewind is `application/gzip`) |
 | GET /rewind/ID | Replay page for a report's rewind. The page holds no report data; it asks for the owner credential and reads the rewind with it |
 | DELETE /api/v1/feedback/ID | Owner: delete the report and its attachments |
+
+Link previews are generic by default: a request without the key learns nothing about a share. A preview card is opt-in per share and publishes the share's title and that image to anyone who has the link's path, even without the key; delete the card or revoke the share to take them back.
 
 Playback URL for another app's video player: share link `https://HOST/s/ID#TOKEN` becomes `https://HOST/api/v1/shares/ID/media?token=TOKEN`. The token is a bearer capability in the URL, so keep it out of logs. The viewer page is still not embeddable.
 

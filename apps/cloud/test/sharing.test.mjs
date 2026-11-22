@@ -637,6 +637,247 @@ test("captions uploaded while the share is being revoked are not kept", async ()
 	assert.equal(await bucket.head(`captions/${share.id}`), null);
 });
 
+const png = new Uint8Array([
+	0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3,
+]);
+const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 4, 5, 6]);
+const unknownId = "00000000-0000-0000-0000-000000000000";
+const trickyTitle = `Q3 "plan" <b>&co's</b>`;
+const decode = (value) =>
+	value
+		.replaceAll("&quot;", '"')
+		.replaceAll("&#39;", "'")
+		.replaceAll("&#x27;", "'")
+		.replaceAll("&lt;", "<")
+		.replaceAll("&gt;", ">")
+		.replaceAll("&amp;", "&");
+const putCard = (id, extra, body = png) =>
+	request(`/api/v1/shares/${id}/card`, { method: "PUT", body, headers: extra });
+const page = async (id) => (await request(`/s/${id}`)).text();
+
+test("card: only the owner stores one, only a bounded JPEG or PNG is accepted, and the owner can replace and remove it", async () => {
+	const share = await create(new Uint8Array([1, 2, 3]), {
+		title: trickyTitle,
+	});
+	const path = `/api/v1/shares/${share.id}`;
+	const read = { Authorization: `Bearer ${share.sharePath.split("#")[1]}` };
+	const metadata = async () =>
+		(await request(`${path}/metadata`, { headers: read })).json();
+	assert.equal((await metadata()).card, false);
+
+	assert.equal((await putCard(share.id, {})).status, 401);
+	assert.equal(
+		(await putCard(share.id, { Authorization: "Bearer wrong" })).status,
+		401,
+	);
+	assert.equal((await putCard(share.id, read)).status, 401);
+	assert.equal((await metadata()).card, false);
+
+	const bucket = await runtime.getR2Bucket("MEDIA");
+	const record = await (await bucket.get(`shares/${share.id}.json`)).json();
+	await bucket.put(
+		`shares/${share.id}.json`,
+		JSON.stringify({ ...record, owner: "someone-else" }),
+	);
+	assert.equal((await putCard(share.id, headers)).status, 404);
+	await bucket.put(`shares/${share.id}.json`, JSON.stringify(record));
+
+	assert.equal(
+		(await putCard(share.id, headers, "<svg onload=alert(1)>")).status,
+		400,
+	);
+	assert.equal(
+		(await putCard(share.id, headers, new Uint8Array([0x89, 0x50, 0x4e]))).status,
+		400,
+	);
+	const oversize = new Uint8Array(2 * 1024 * 1024 + 1);
+	oversize.set(png);
+	assert.equal((await putCard(share.id, headers, oversize)).status, 413);
+	assert.equal((await metadata()).card, false);
+
+	const limit = new Uint8Array(2 * 1024 * 1024);
+	limit.set(jpeg);
+	assert.equal((await putCard(share.id, headers, limit)).status, 204);
+	assert.equal((await putCard(share.id, headers, png)).status, 204);
+	assert.equal((await metadata()).card, true);
+
+	const cardPath = `/s/${share.id}/card`;
+	const served = await request(cardPath, { redirect: "manual" });
+	assert.equal(served.status, 200);
+	assert.equal(served.headers.get("Content-Type"), "image/png");
+	assert.deepEqual(new Uint8Array(await served.arrayBuffer()), png);
+	const head = await request(cardPath, { method: "HEAD" });
+	assert.equal(head.status, 200);
+	assert.equal(head.headers.get("Content-Type"), "image/png");
+	assert.equal(head.headers.get("Content-Length"), `${png.length}`);
+	assert.equal((await head.arrayBuffer()).byteLength, 0);
+	assert.equal(
+		(await request(`${cardPath}.`, { redirect: "manual" })).status === 302,
+		false,
+	);
+
+	assert.equal((await putCard(share.id, headers, jpeg)).status, 204);
+	assert.equal(
+		(await request(cardPath)).headers.get("Content-Type"),
+		"image/jpeg",
+	);
+
+	const del = (extra) =>
+		request(`${path}/card`, { method: "DELETE", headers: extra });
+	assert.equal((await del({})).status, 401);
+	assert.equal((await del(read)).status, 401);
+	assert.equal((await metadata()).card, true);
+	assert.equal((await del(headers)).status, 204);
+	assert.equal((await metadata()).card, false);
+	assert.equal((await request(cardPath)).status, 404);
+});
+
+test("card: a share that is not published cannot have one, an image share can", async () => {
+	const pending = await request("/api/v1/shares", {
+		method: "POST",
+		headers,
+		body: JSON.stringify({
+			title: "pending",
+			contentType: "video/mp4",
+			size: 5,
+		}),
+	});
+	const { id } = await pending.json();
+	assert.equal((await putCard(id, headers)).status, 409);
+	assert.equal((await request(`/s/${id}/card`)).status, 404);
+	const image = await create(new Uint8Array([1, 2, 3]), {
+		contentType: "image/png",
+	});
+	assert.equal((await putCard(image.id, headers)).status, 204);
+	assert.equal((await request(`/s/${image.id}/card`)).status, 200);
+	assert.equal((await putCard(unknownId, headers)).status, 404);
+});
+
+test("card: the viewer page shows the title and card only for a live share that has one", async () => {
+	const generic = await page(unknownId);
+	const share = await create(new Uint8Array([1, 2, 3]), {
+		title: trickyTitle,
+	});
+	assert.equal(await page(share.id), generic);
+
+	assert.equal((await putCard(share.id, headers)).status, 204);
+	const carded = await page(share.id);
+	assert.notEqual(carded, generic);
+	assert.doesNotMatch(carded, /<b>/);
+	assert.doesNotMatch(carded, /%origin%|%app%/);
+	const attribute = (property) =>
+		decode(
+			new RegExp(`<meta (?:property|name)="${property}" content="([^"]*)">`).exec(
+				carded,
+			)[1],
+		);
+	assert.equal(attribute("og:title"), trickyTitle);
+	assert.equal(attribute("twitter:title"), trickyTitle);
+	assert.equal(
+		decode(/<title>([^<]*)<\/title>/.exec(carded)[1]),
+		trickyTitle,
+	);
+	const absolute = `https://sharing.test/s/${share.id}/card`;
+	assert.equal(attribute("og:image"), absolute);
+	assert.equal(attribute("twitter:image"), absolute);
+	assert.equal(attribute("og:image:type"), "image/png");
+	assert.doesNotMatch(carded, /og:image:width|og:image:height/);
+	assert.match(carded, /<meta property="og:description" content="[^"]+">/);
+	assert.match(carded, /<script src="\/viewer\.js" defer>/);
+	assert.equal(await page(unknownId), generic);
+
+	const uncarded = await create(new Uint8Array([1, 2, 3]), {
+		title: "Never shown",
+	});
+	assert.equal(await page(uncarded.id), generic);
+
+	assert.equal((await putCard(share.id, headers, jpeg)).status, 204);
+	assert.match(await page(share.id), /og:image:type" content="image\/jpeg"/);
+
+	const path = `/api/v1/shares/${share.id}`;
+	assert.equal(
+		(await request(`${path}/card`, { method: "DELETE", headers })).status,
+		204,
+	);
+	assert.equal(await page(share.id), generic);
+	assert.equal((await request(`/s/${share.id}/card`)).status, 404);
+});
+
+test("card: revoking or expiring a share takes its title and image back", async () => {
+	const generic = await page(unknownId);
+	const missing = await request(`/s/${unknownId}/card`);
+	assert.equal(missing.status, 404);
+	const missingBody = await missing.text();
+	const bucket = await runtime.getR2Bucket("MEDIA");
+
+	const revoked = await create(new Uint8Array([1, 2, 3]));
+	assert.equal((await putCard(revoked.id, headers)).status, 204);
+	assert.equal(
+		(
+			await request(`/api/v1/shares/${revoked.id}`, {
+				method: "DELETE",
+				headers,
+			})
+		).status,
+		204,
+	);
+	assert.equal(await bucket.head(`cards/${revoked.id}`), null);
+	assert.equal(await page(revoked.id), generic);
+	assert.equal(await (await request(`/s/${revoked.id}/card`)).text(), missingBody);
+	assert.equal((await putCard(revoked.id, headers)).status, 404);
+
+	const lapsing = await create(new Uint8Array([1, 2, 3]));
+	assert.equal((await putCard(lapsing.id, headers)).status, 204);
+	assert.equal((await request(`/s/${lapsing.id}/card`)).status, 200);
+	const manifest = await (await bucket.get(`shares/${lapsing.id}.json`)).json();
+	manifest.expiresAt = Date.now() - 1;
+	await bucket.put(`shares/${lapsing.id}.json`, JSON.stringify(manifest));
+	assert.equal(await page(lapsing.id), generic);
+	const expired = await request(`/s/${lapsing.id}/card`);
+	assert.equal(expired.status, 404);
+	assert.equal(await expired.text(), missingBody);
+	assert.equal((await request(`/s/${lapsing.id}/card`, { method: "HEAD" })).status, 404);
+});
+
+test("a card uploaded while the share is being revoked is not kept", async () => {
+	const share = await create(new Uint8Array([1, 2, 3]));
+	const path = `/api/v1/shares/${share.id}`;
+	let release;
+	const gate = new Promise((resolve) => {
+		release = resolve;
+	});
+	let started;
+	const begun = new Promise((resolve) => {
+		started = resolve;
+	});
+	const body = new ReadableStream({
+		async start(controller) {
+			controller.enqueue(png);
+			started();
+			await gate;
+			controller.enqueue(new Uint8Array([9, 9, 9]));
+			controller.close();
+		},
+	});
+	const pending = request(`${path}/card`, {
+		method: "PUT",
+		headers,
+		body,
+		duplex: "half",
+	});
+	await begun;
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	assert.equal(
+		(await request(path, { method: "DELETE", headers })).status,
+		204,
+	);
+	release();
+	assert.equal((await pending).status, 404);
+	const bucket = await runtime.getR2Bucket("MEDIA");
+	assert.equal(await bucket.head(`cards/${share.id}`), null);
+	assert.equal((await request(`/s/${share.id}/card`)).status, 404);
+});
+
 test("the cloud home page works with exact HTML asset routing", async () => {
 	const result = await request("/", { redirect: "manual" });
 	assert.equal(result.status, 200);
