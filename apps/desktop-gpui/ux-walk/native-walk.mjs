@@ -53,6 +53,12 @@ const isDiatribe = (journal) =>
 	journal.request.kind === DIATRIBE || isNotes(journal);
 const notesName = (journal) => (isNotes(journal) ? "Notes" : "Diatribe");
 const noBrowser = () => ({ events: [], coverage: {} });
+const reportModeName = (journal) =>
+	isDiatribe(journal) ? notesName(journal) : walkModeName;
+const walkTitle = (journal) => ({
+	topic: journal.request.topic,
+	description: journal.description?.trim() || undefined,
+});
 
 function instantProject(project) {
 	const meta = JSON.parse(
@@ -371,7 +377,7 @@ export async function nameWalkVoices(
 	saveVoiceNames(directory, names, { skipped });
 	let lease;
 	try {
-		lease = await acquireWalkLock(directory, "processing", { waitMs: 0 });
+		lease = await holdProcessing(file, directory, { waitMs: 0 });
 	} catch {
 		return { applied: false, pending: true };
 	}
@@ -418,6 +424,9 @@ export async function nameWalkVoices(
 	}
 }
 
+// A retitle or a voice-name save holds the lock for milliseconds; a run that starts just then
+// waits for it instead of failing the walk as busy.
+const BRIEF_HOLD_MS = 3000;
 const ITEMS_MARKER = /<!--items-notice-->[\s\S]*?<!--\/items-notice-->/;
 const MIN_BRIEF_S = 20;
 
@@ -502,8 +511,8 @@ async function refreshItems(file, cfg, { retry, dependencies = {} }) {
 export async function retryWalkItems(file, loaded, dependencies = {}) {
 	const journal = readJournal(file);
 	const { cfg } = withRecordingProject(journal, loaded);
-	const lease = await acquireWalkLock(journal.request.directory, "processing", {
-		waitMs: dependencies.waitMs ?? 0,
+	const lease = await holdProcessing(file, journal.request.directory, {
+		waitMs: dependencies.waitMs ?? BRIEF_HOLD_MS,
 	});
 	try {
 		return await refreshItems(file, cfg, { retry: true, dependencies });
@@ -513,7 +522,7 @@ export async function retryWalkItems(file, loaded, dependencies = {}) {
 }
 
 function writeNativeReport(directory, session, journal, browser, notice = "") {
-	const modeName = isDiatribe(journal) ? notesName(journal) : walkModeName;
+	const modeName = reportModeName(journal);
 	const report = path.join(directory, "report.html");
 	if (fs.existsSync(report))
 		fs.renameSync(report, path.join(directory, "evidence.html"));
@@ -584,9 +593,85 @@ function writeNativeReport(directory, session, journal, browser, notice = "") {
 		.join("");
 	fs.writeFileSync(
 		report,
-		`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHTML(session.topic)} · ${escapeHTML(modeName)}</title><style>body{font:16px system-ui;color:#20242c;background:#fafaf9;max-width:960px;margin:48px auto;padding:0 24px;line-height:1.6}h1{font-size:32px;line-height:1.2}h2{margin-top:40px}video{width:100%;border-radius:12px;background:#15171c}a{color:#2467d5}.notice{border-left:4px solid #c2410c;background:#fff4ec;padding:4px 16px;border-radius:6px}code{overflow-wrap:anywhere;font-size:13px}time{color:#666;font-variant-numeric:tabular-nums;margin-right:12px}li{margin:12px 0;overflow-wrap:anywhere}.meta{color:#666;font-size:14px}</style><p class="meta">${escapeHTML(modeName)}</p><h1>${escapeHTML(session.topic)}</h1><p class="meta">${escapeHTML(session.startedAt)}${session.url ? ` · ${escapeHTML(session.url)}` : ""}</p><p class="meta" id="voices">${voiceLegend(directory)}</p>${notice}<h2>Notes</h2>${notes ? `<ul>${notes}</ul>` : "<p>No notes added.</p>"}${chapters}${browserDetails ? `<h2>Browser evidence</h2><ul>${browserDetails}</ul><p>${browserLinks}</p>` : ""}${findings ? `<h3>Console and failed requests</h3><ul>${findings}</ul><p class="meta">Up to 200 observations shown. The timeline and action log retain the full captured evidence.</p>` : ""}<h2>Capture details</h2><p class="meta">Recorded locally. Notes, chapters and browser events use the recorder’s elapsed time, excluding pauses; first-frame alignment is approximate.</p><p><a href="media/video.mp4">Full recording</a> · <a href="native-walk.json">Saved journal</a> · <a href="session.json">Session</a></p></html>`,
+		`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHTML(session.topic)} · ${escapeHTML(modeName)}</title><style>body{font:16px system-ui;color:#20242c;background:#fafaf9;max-width:960px;margin:48px auto;padding:0 24px;line-height:1.6}h1{font-size:32px;line-height:1.2}h2{margin-top:40px}video{width:100%;border-radius:12px;background:#15171c}a{color:#2467d5}.notice{border-left:4px solid #c2410c;background:#fff4ec;padding:4px 16px;border-radius:6px}code{overflow-wrap:anywhere;font-size:13px}time{color:#666;font-variant-numeric:tabular-nums;margin-right:12px}li{margin:12px 0;overflow-wrap:anywhere}.meta{color:#666;font-size:14px}</style><p class="meta">${escapeHTML(modeName)}</p>${reportHeading(session)}<p class="meta">${escapeHTML(session.startedAt)}${session.url ? ` · ${escapeHTML(session.url)}` : ""}</p><p class="meta" id="voices">${voiceLegend(directory)}</p>${notice}<h2>Notes</h2>${notes ? `<ul>${notes}</ul>` : "<p>No notes added.</p>"}${chapters}${browserDetails ? `<h2>Browser evidence</h2><ul>${browserDetails}</ul><p>${browserLinks}</p>` : ""}${findings ? `<h3>Console and failed requests</h3><ul>${findings}</ul><p class="meta">Up to 200 observations shown. The timeline and action log retain the full captured evidence.</p>` : ""}<h2>Capture details</h2><p class="meta">Recorded locally. Notes, chapters and browser events use the recorder’s elapsed time, excluding pauses; first-frame alignment is approximate.</p><p><a href="media/video.mp4">Full recording</a> · <a href="native-walk.json">Saved journal</a> · <a href="session.json">Session</a></p></html>`,
 		{ mode: 0o600 },
 	);
+}
+
+const reportHeading = (session) =>
+	`<h1>${escapeHTML(session.topic)}</h1><p id="about" style="white-space:pre-line"${session.description ? "" : " hidden"}>${escapeHTML(session.description)}</p>`;
+
+function retitledReport(html, session, modeName) {
+	return html
+		.replace(
+			/<title>[\s\S]*?<\/title>/,
+			() =>
+				`<title>${escapeHTML(session.topic)} · ${escapeHTML(modeName)}</title>`,
+		)
+		.replace(/<h1>[\s\S]*?<\/h1>(<p id="about"[^>]*>[\s\S]*?<\/p>)?/, () =>
+			reportHeading(session),
+		);
+}
+
+function applyWalkTitle(file) {
+	const journal = readJournal(file, { complete: false });
+	const directory = journal.request.directory;
+	const sessionFile = path.join(directory, "session.json");
+	if (!fs.existsSync(sessionFile)) return false;
+	const session = {
+		...JSON.parse(fs.readFileSync(sessionFile, "utf8")),
+		...walkTitle(journal),
+	};
+	save(sessionFile, session);
+	const report = path.join(directory, "report.html");
+	if (fs.existsSync(report))
+		fs.writeFileSync(
+			report,
+			retitledReport(
+				fs.readFileSync(report, "utf8"),
+				session,
+				reportModeName(journal),
+			),
+			{ mode: 0o600 },
+		);
+	return true;
+}
+
+// Every holder of the processing lock applies the journal's title as it lets go, so a rename
+// that finds the walk busy reaches the session and report when the holder finishes.
+async function holdProcessing(file, directory, options) {
+	const lease = await acquireWalkLock(directory, "processing", options);
+	let released = false;
+	return {
+		async release() {
+			if (released) return;
+			released = true;
+			try {
+				applyWalkTitle(file);
+			} catch {}
+			await lease.release();
+		},
+	};
+}
+
+// Renames a processed recording without reprocessing it. Before the first processing run there
+// is nothing to patch, and that run reads the title from the journal. The short wait covers a
+// holder that read the journal just before the rename and is already letting go.
+export async function retitleNativeWalk(file, { waitMs = 2000 } = {}) {
+	const directory = readJournal(file, { complete: false }).request.directory;
+	if (!fs.existsSync(path.join(directory, "session.json")))
+		return { applied: false, pending: false };
+	let lease;
+	try {
+		lease = await acquireWalkLock(directory, "processing", { waitMs });
+	} catch {
+		return { applied: false, pending: true };
+	}
+	try {
+		return { applied: applyWalkTitle(file), pending: false };
+	} finally {
+		await lease.release();
+	}
 }
 
 export async function finishNativeWalk(file, loaded, dependencies = {}) {
@@ -594,10 +679,10 @@ export async function finishNativeWalk(file, loaded, dependencies = {}) {
 	const directory = journal.request.directory;
 	// The recording's project layers its glossary, source folder and notes over the config.
 	const { cfg, project: projectId } = withRecordingProject(journal, loaded);
-	const processingLease = await acquireWalkLock(directory, "processing", {
+	const processingLease = await holdProcessing(file, directory, {
 		waitMs: dependencies.reconcileStopTail
 			? (dependencies.reconcileWaitMs ?? 150000)
-			: 0,
+			: (dependencies.waitMs ?? BRIEF_HOLD_MS),
 	});
 	const stages = {};
 	let processingOwned = true;
@@ -657,7 +742,7 @@ export async function finishNativeWalk(file, loaded, dependencies = {}) {
 			? noBrowser()
 			: projectBrowserEvidence(file, journal);
 		const session = {
-			topic: journal.request.topic,
+			...walkTitle(journal),
 			url:
 				diatribe || browser.ownedWindow === false
 					? null
@@ -1202,6 +1287,7 @@ export async function finishNativeWalk(file, loaded, dependencies = {}) {
 				completedAt: Date.now(),
 			});
 		}
+		applyWalkTitle(file);
 		progress("ready", null, {
 			...(stages.transcript === "disabled"
 				? {}
@@ -1714,6 +1800,8 @@ if (isMainModule()) {
 					}),
 				),
 			);
+		} else if (command === "retitle") {
+			console.log(JSON.stringify(await retitleNativeWalk(file)));
 		} else if (command === "save-items") {
 			const request = JSON.parse(fs.readFileSync(file, "utf8"));
 			console.log(
@@ -1730,7 +1818,7 @@ if (isMainModule()) {
 			);
 		} else
 			throw new Error(
-				"Usage: native-walk.mjs snapshot|process|retry-items|handoff|handoff-ask|items|file|glossary-suggestions|glossary-accept|glossary-reject|assign-project <file>, or projects|trackers|save-project|delete-project|targets",
+				"Usage: native-walk.mjs snapshot|process|retry-items|handoff|handoff-ask|items|file|glossary-suggestions|glossary-accept|glossary-reject|assign-project|retitle <file>, or projects|trackers|save-project|delete-project|targets",
 			);
 	} catch (error) {
 		console.error(error.message);

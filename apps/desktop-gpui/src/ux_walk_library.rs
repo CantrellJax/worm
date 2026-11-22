@@ -226,6 +226,17 @@ pub fn read_summary(file: &Path) -> Result<WalkSummary, String> {
     read_walk(file).map(|(summary, _)| summary)
 }
 
+/// Read fresh from disk so a rename never writes back a stale copy of the journal.
+pub fn rename_walk(
+    file: &Path,
+    topic: &str,
+    description: &str,
+) -> Result<crate::ux_walk_journal::Journal, String> {
+    let (_, mut journal) = read_walk(file)?;
+    journal.rename(topic, description)?;
+    Ok(journal)
+}
+
 pub fn view_events(
     summary: &WalkSummary,
     journal: &crate::ux_walk_journal::Journal,

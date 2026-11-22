@@ -18,6 +18,10 @@ pub struct WalkState {
     pub notice: String,
     pub checkpoint_notice: String,
     pub note_draft: String,
+    /// Stop handed this recording to the walk window. Taken by the phase observer, which
+    /// leaves the recorder hidden so the finish does not read as "record again", and clears
+    /// the recorder topic this walk used.
+    pub finished: bool,
     pub(super) restarting: bool,
     checkpoint_monitor: Option<Task<()>>,
 }
@@ -38,6 +42,7 @@ impl WalkState {
                 .into(),
             checkpoint_notice: String::new(),
             note_draft: String::new(),
+            finished: false,
             restarting: false,
             checkpoint_monitor: None,
         }
@@ -433,6 +438,7 @@ impl RecordingSession {
         if let Err(error) = walk.complete(elapsed) {
             self.walk.notice = format!("Walk files saved; could not finish the journal: {error}");
             external::fail(external_id.as_deref(), &self.walk.notice);
+            self.walk.finished = true;
             self.finish(cx);
             cx.defer(crate::ux_walk_window::open);
             return true;
@@ -457,6 +463,7 @@ impl RecordingSession {
                 if this.recording_generation != generation || this.phase != Phase::Stopping {
                     return;
                 }
+                this.walk.finished = true;
                 this.finish(cx);
                 match result {
                     Ok(_) => this.process_walk(cx),
@@ -707,6 +714,7 @@ mod tests {
             notice: String::new(),
             checkpoint_notice: String::new(),
             note_draft: String::new(),
+            finished: false,
             restarting: false,
             checkpoint_monitor: None,
         }

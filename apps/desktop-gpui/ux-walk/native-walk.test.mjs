@@ -11,10 +11,12 @@ import {
 	finishNativeWalk,
 	nameWalkVoices,
 	nativeWalkPrompt,
+	retitleNativeWalk,
 	retryWalkItems,
 	snapshotNativeWalk,
 } from "./native-walk.mjs";
 import { walkModeName } from "./walk-brand.mjs";
+import { acquireWalkLock } from "./walk-lock.mjs";
 
 function fixture(t) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ux-walk-native-"));
@@ -207,6 +209,115 @@ test("a partial failed export cannot block a retry or replace the source", async
 	assert.ok(report.includes("Payment"));
 	assert.ok(report.includes("video.mp4"));
 	assert.ok(report.includes(` · ${walkModeName}</title>`));
+});
+
+test("a rename as processing starts neither waits on the lock nor fails the walk", async (t) => {
+	const f = fixture(t);
+	const lease = await acquireWalkLock(f.directory, "processing");
+	const letGo = new Promise((resolve) =>
+		setTimeout(() => resolve(lease.release()), 300),
+	);
+	try {
+		assert.deepEqual(await retitleNativeWalk(f.file, { waitMs: 0 }), {
+			applied: false,
+			pending: false,
+		});
+		await finishNativeWalk(
+			f.file,
+			{ transcriber: "none", brief: false },
+			{
+				client: {
+					export: async (_project, output) => {
+						fs.writeFileSync(output, "export");
+						return { durationS: 10 };
+					},
+				},
+				clip: async (_input, output) => fs.writeFileSync(output, "clip"),
+				processChapter: async () => ({}),
+				writeIndex: () => {},
+				writeReport: () => {},
+			},
+		);
+	} finally {
+		await letGo;
+	}
+	assert.equal(
+		JSON.parse(fs.readFileSync(path.join(f.directory, "processing.json")))
+			.state,
+		"ready",
+	);
+});
+
+test("a rename reaches the session and report without reprocessing, even mid-processing", async (t) => {
+	const f = fixture(t);
+	await finishNativeWalk(
+		f.file,
+		{ transcriber: "none", brief: false },
+		{
+			client: {
+				export: async (_project, output) => {
+					fs.writeFileSync(output, "export");
+					return { durationS: 10 };
+				},
+			},
+			clip: async (_input, output) => fs.writeFileSync(output, "clip"),
+			processChapter: async () => {
+				f.journal.request.topic = "Renamed while processing";
+				f.save();
+				assert.deepEqual(await retitleNativeWalk(f.file, { waitMs: 0 }), {
+					applied: false,
+					pending: true,
+				});
+				return {};
+			},
+			writeIndex: () => {},
+			writeReport: () => {},
+		},
+	);
+	const read = () => [
+		JSON.parse(fs.readFileSync(path.join(f.directory, "session.json"))),
+		fs.readFileSync(path.join(f.directory, "report.html"), "utf8"),
+	];
+	let [session, report] = read();
+	assert.equal(session.topic, "Renamed while processing");
+	assert.ok(
+		report.includes(
+			`<title>Renamed while processing · ${walkModeName}</title>`,
+		),
+	);
+	assert.ok(report.includes("<h1>Renamed while processing</h1>"));
+
+	f.journal.request.topic = "Payments <page>";
+	f.journal.description = "Card form drops the postcode\nSafari only";
+	f.save();
+	assert.deepEqual(await retitleNativeWalk(f.file), {
+		applied: true,
+		pending: false,
+	});
+	[session, report] = read();
+	assert.equal(session.topic, "Payments <page>");
+	assert.equal(
+		session.description,
+		"Card form drops the postcode\nSafari only",
+	);
+	assert.ok(
+		report.includes(`<title>Payments &lt;page&gt; · ${walkModeName}</title>`),
+	);
+	assert.ok(report.includes("<h1>Payments &lt;page&gt;</h1>"));
+	assert.match(
+		report,
+		/<p id="about"[^>]*>Card form drops the postcode\nSafari only<\/p>/,
+	);
+	assert.ok(report.includes("Clipped button"));
+
+	delete f.journal.description;
+	f.save();
+	await retitleNativeWalk(f.file);
+	[session, report] = read();
+	assert.equal(session.description, undefined);
+	assert.match(report, /<p id="about"[^>]* hidden><\/p>/);
+	assert.equal(report.match(/<h1>/g).length, 1);
+	assert.equal(report.match(/id="about"/g).length, 1);
 });
 
 test("the report and agent prompt name the mode from the brand door", (t) => {
@@ -2109,4 +2220,63 @@ test("a failing refresh does not demote a ready walk", async (t) => {
 		},
 	});
 	assert.equal(f.status().state, "ready");
+});
+
+test("a rename that finds the walk busy lands when voice naming, an item retry or a failed run lets go", async (t) => {
+	const f = await walkWithoutItems(t);
+	const session = () => JSON.parse(f.read("session.json"));
+	const renameWhileBusy = async (topic) => {
+		f.journal.request.topic = topic;
+		f.save();
+		assert.deepEqual(await retitleNativeWalk(f.file, { waitMs: 0 }), {
+			applied: false,
+			pending: true,
+		});
+	};
+
+	fs.writeFileSync(
+		path.join(f.directory, "voices.json"),
+		JSON.stringify({
+			schemaVersion: 1,
+			inputHash: "lineup",
+			voices: [{ id: "voice-1", label: "Speaker 1" }],
+		}),
+	);
+	let relabelled = 0;
+	await nameWalkVoices(f.file, { "voice-1": "Ann" }, f.cfg, {
+		processChapter: async () => {
+			relabelled++;
+			await renameWhileBusy("Named voices");
+			return {};
+		},
+		writeIndex: () => {},
+	});
+	assert.equal(relabelled, 1);
+	assert.equal(session().topic, "Named voices");
+	assert.match(f.read("report.html"), /<h1>Named voices<\/h1>/);
+
+	await retryWalkItems(f.file, f.cfg, {
+		runBrief: async () => {
+			await renameWhileBusy("Retried items");
+			throw new Error("offline");
+		},
+	});
+	assert.equal(session().topic, "Retried items");
+	assert.match(f.read("report.html"), /<h1>Retried items<\/h1>/);
+
+	fs.rmSync(path.join(f.directory, "processing.json"));
+	fs.rmSync(path.join(f.directory, "media/export.json"));
+	await assert.rejects(
+		finishNativeWalk(f.file, f.cfg, {
+			client: {
+				export: async () => {
+					await renameWhileBusy("Failed run");
+					throw new Error("export failed");
+				},
+			},
+		}),
+		/export failed/,
+	);
+	assert.equal(session().topic, "Failed run");
+	assert.match(f.read("report.html"), /<h1>Failed run<\/h1>/);
 });

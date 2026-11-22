@@ -91,6 +91,8 @@ pub struct Journal {
     pub state: String,
     pub duration_ms: Option<u64>,
     pub events: Vec<Event>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 impl Journal {
@@ -121,6 +123,7 @@ impl Journal {
             state: "recording".into(),
             duration_ms: None,
             events: Vec::new(),
+            description: String::new(),
         };
         journal.save()?;
         Ok(journal)
@@ -213,6 +216,24 @@ impl Journal {
         if let Err(error) = self.save() {
             self.state = "recording".into();
             self.duration_ms = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn rename(&mut self, topic: &str, description: &str) -> Result<(), String> {
+        let topic = topic.trim();
+        if topic.is_empty() {
+            return Err("Give this recording a title.".into());
+        }
+        if self.state == "recording" {
+            return Err("Rename the recording after it stops.".into());
+        }
+        let topic = std::mem::replace(&mut self.request.topic, topic.into());
+        let description = std::mem::replace(&mut self.description, description.trim().into());
+        if let Err(error) = self.save() {
+            self.request.topic = topic;
+            self.description = description;
             return Err(error);
         }
         Ok(())

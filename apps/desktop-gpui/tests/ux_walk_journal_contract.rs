@@ -246,3 +246,33 @@ fn notes_for_an_earlier_recording_are_written_complete() {
     assert!(Journal::finished(req.clone(), PathBuf::from("/recordings/old.cap"), 1, 1).is_err());
     fs::remove_dir_all(req.directory).unwrap();
 }
+
+#[test]
+fn a_stopped_recording_takes_a_new_title_and_description_and_keeps_its_notes() {
+    let req = request();
+    let mut walk =
+        Journal::begin(req.clone(), PathBuf::from("/recordings/a.cap"), 100_000).unwrap();
+    walk.add("note", "Keep me", 1_000).unwrap();
+    assert!(walk.rename("Payments", "").is_err());
+    walk.complete(5_000).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(walk.file()).unwrap()).unwrap();
+    assert!(saved.get("description").is_none());
+    assert!(walk.rename("   ", "About").is_err());
+    walk.rename(
+        "  Payments page  ",
+        "  Card form drops the postcode\nOn Safari only ",
+    )
+    .unwrap();
+    let reopened: Journal = serde_json::from_slice(&fs::read(walk.file()).unwrap()).unwrap();
+    assert_eq!(reopened.request.topic, "Payments page");
+    assert_eq!(
+        reopened.description,
+        "Card form drops the postcode\nOn Safari only"
+    );
+    assert_eq!(reopened.state, "complete");
+    assert_eq!(reopened.events[0].text, "Keep me");
+    walk.rename("Payments page", "").unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(walk.file()).unwrap()).unwrap();
+    assert!(saved.get("description").is_none());
+    fs::remove_dir_all(req.directory).unwrap();
+}
