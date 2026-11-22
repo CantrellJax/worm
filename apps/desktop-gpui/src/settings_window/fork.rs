@@ -107,7 +107,7 @@ fn shown_walk(item: &RecordingItem) -> Option<&crate::ux_walk_library::WalkSumma
 
 pub(super) fn row_title(item: &RecordingItem) -> String {
     match shown_walk(item) {
-        Some(walk) if walk.diatribe => {
+        Some(walk) if walk.diatribe && walk.topic == crate::ux_walk::DIATRIBE_TOPIC => {
             chrono::TimeZone::timestamp_millis_opt(&chrono::Local, walk.started_at_ms as i64)
                 .single()
                 .map_or_else(
@@ -631,6 +631,9 @@ mod tests {
             .unwrap();
         talk.walk.as_mut().unwrap().started_at_ms = started.timestamp_millis() as u64;
         assert_eq!(row_title(&talk), "Diatribe 2026-11-05 18.20");
+        let mut renamed = talk.clone();
+        renamed.walk.as_mut().unwrap().topic = "Hiring plan".into();
+        assert_eq!(row_title(&renamed), "Hiring plan");
         let mut walk = talk.clone();
         walk.walk.as_mut().unwrap().diatribe = false;
         assert_eq!(row_label(&walk), fork_brand::WALK_MODE_NAME);

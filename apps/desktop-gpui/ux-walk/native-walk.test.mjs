@@ -11,6 +11,7 @@ import {
 	finishNativeWalk,
 	nameWalkVoices,
 	nativeWalkPrompt,
+	retitleNativeWalk,
 	retryWalkItems,
 	snapshotNativeWalk,
 } from "./native-walk.mjs";
@@ -207,6 +208,78 @@ test("a partial failed export cannot block a retry or replace the source", async
 	assert.ok(report.includes("Payment"));
 	assert.ok(report.includes("video.mp4"));
 	assert.ok(report.includes(` · ${walkModeName}</title>`));
+});
+
+test("a rename reaches the session and report without reprocessing, even mid-processing", async (t) => {
+	const f = fixture(t);
+	await finishNativeWalk(
+		f.file,
+		{ transcriber: "none", brief: false },
+		{
+			client: {
+				export: async (_project, output) => {
+					fs.writeFileSync(output, "export");
+					return { durationS: 10 };
+				},
+			},
+			clip: async (_input, output) => fs.writeFileSync(output, "clip"),
+			processChapter: async () => {
+				f.journal.request.topic = "Renamed while processing";
+				f.save();
+				assert.deepEqual(await retitleNativeWalk(f.file), {
+					applied: false,
+					pending: true,
+				});
+				return {};
+			},
+			writeIndex: () => {},
+			writeReport: () => {},
+		},
+	);
+	const read = () => [
+		JSON.parse(fs.readFileSync(path.join(f.directory, "session.json"))),
+		fs.readFileSync(path.join(f.directory, "report.html"), "utf8"),
+	];
+	let [session, report] = read();
+	assert.equal(session.topic, "Renamed while processing");
+	assert.ok(
+		report.includes(
+			`<title>Renamed while processing · ${walkModeName}</title>`,
+		),
+	);
+	assert.ok(report.includes("<h1>Renamed while processing</h1>"));
+
+	f.journal.request.topic = "Payments <page>";
+	f.journal.description = "Card form drops the postcode\nSafari only";
+	f.save();
+	assert.deepEqual(await retitleNativeWalk(f.file), {
+		applied: true,
+		pending: false,
+	});
+	[session, report] = read();
+	assert.equal(session.topic, "Payments <page>");
+	assert.equal(
+		session.description,
+		"Card form drops the postcode\nSafari only",
+	);
+	assert.ok(
+		report.includes(`<title>Payments &lt;page&gt; · ${walkModeName}</title>`),
+	);
+	assert.ok(report.includes("<h1>Payments &lt;page&gt;</h1>"));
+	assert.match(
+		report,
+		/<p id="about"[^>]*>Card form drops the postcode\nSafari only<\/p>/,
+	);
+	assert.ok(report.includes("Clipped button"));
+
+	delete f.journal.description;
+	f.save();
+	await retitleNativeWalk(f.file);
+	[session, report] = read();
+	assert.equal(session.description, undefined);
+	assert.match(report, /<p id="about"[^>]* hidden><\/p>/);
+	assert.equal(report.match(/<h1>/g).length, 1);
+	assert.equal(report.match(/id="about"/g).length, 1);
 });
 
 test("the report and agent prompt name the mode from the brand door", (t) => {

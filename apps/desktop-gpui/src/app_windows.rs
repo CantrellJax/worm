@@ -625,12 +625,13 @@ pub fn init(main: WindowHandle<MainWindow>, session: Entity<RecordingSession>, c
             if !restore_clean_capture_ui(cx) {
                 return;
             }
-            let (finished_studio, preparing_editor, finished_instant) =
-                session.update(cx, |session, _| {
+            let (finished_studio, preparing_editor, finished_instant, finished_walk) = session
+                .update(cx, |session, _| {
                     (
                         session.finished_studio.take(),
                         session.take_preparing_studio_editor(),
                         std::mem::take(&mut session.finished_instant),
+                        std::mem::take(&mut session.walk.finished),
                     )
                 });
             // The in-editor re-record target is consumed first, before
@@ -681,10 +682,13 @@ pub fn init(main: WindowHandle<MainWindow>, session: Entity<RecordingSession>, c
                 // lease before this runs, so it keeps reshowing as before. A
                 // main window reopened mid-recording (even if minimized since)
                 // takes the reshow too, which resumes its inputs.
-                let keep_hidden_after_instant = cfg!(not(target_os = "linux"))
-                    && finished_instant
-                    && settings.post_instant_behaviour()
-                        != crate::store::PostInstantBehaviour::ShowCap
+                // A walk or diatribe finishes in its walk window, so the recorder stays away
+                // the same way.
+                let keep_main_hidden = cfg!(not(target_os = "linux"))
+                    && (finished_walk
+                        || (finished_instant
+                            && settings.post_instant_behaviour()
+                                != crate::store::PostInstantBehaviour::ShowCap))
                     && cx.global::<AppWindows>().main_hidden_by_app
                     && !main
                         .update(cx, |_, window, _| platform::window_is_visible(window))
@@ -697,8 +701,11 @@ pub fn init(main: WindowHandle<MainWindow>, session: Entity<RecordingSession>, c
                         park_idle_camera_preview(cx);
                         crate::menus::schedule_dock_sync(cx);
                     }
-                    (None, _) if keep_hidden_after_instant => {
-                        tracing::info!("main window kept hidden after the Instant recording");
+                    (None, _) if keep_main_hidden => {
+                        tracing::info!(
+                            finished_walk,
+                            "main window kept hidden after the recording"
+                        );
                         park_idle_camera_preview(cx);
                         crate::menus::schedule_dock_sync(cx);
                     }

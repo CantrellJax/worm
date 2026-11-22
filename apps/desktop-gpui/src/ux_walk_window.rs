@@ -201,6 +201,10 @@ struct WalkWindow {
     theme: Theme,
     session: Entity<RecordingSession>,
     input: Entity<ui::TextInputState>,
+    title: Entity<ui::TextInputState>,
+    about: Entity<ui::TextInputState>,
+    /// The stopped recording whose title and description the two fields above show.
+    details: Option<std::path::PathBuf>,
     selection: crate::ux_walk_library::WalkSelection,
     saved: Option<crate::ux_walk_journal::Journal>,
     saved_notes: Option<LoadedNotes>,
@@ -286,12 +290,40 @@ impl WalkWindow {
             }
         })
         .detach();
+        let title = cx.new(|cx| {
+            let mut input = ui::TextInputState::single_line(window, cx);
+            input.set_placeholder("Title");
+            input
+        });
+        cx.subscribe_in(&title, window, |this, _, event, window, cx| {
+            if matches!(
+                event,
+                ui::TextInputEvent::Confirmed | ui::TextInputEvent::Blurred
+            ) {
+                this.save_details(window, cx);
+            }
+        })
+        .detach();
+        let about = cx.new(|cx| {
+            let mut input = ui::TextInputState::multi_line(window, cx);
+            input.set_placeholder("What was this recording about?");
+            input
+        });
+        cx.subscribe_in(&about, window, |this, _, event, window, cx| {
+            if matches!(event, ui::TextInputEvent::Blurred) {
+                this.save_details(window, cx);
+            }
+        })
+        .detach();
         let items = items::ItemsState::new(window, cx);
         Self::start_voices_poll(window, cx);
         Self {
             theme: Theme::for_window(window, cx, false),
             session,
             input,
+            title,
+            about,
+            details: None,
             selection: Default::default(),
             saved: None,
             saved_notes: None,
@@ -339,6 +371,101 @@ impl WalkWindow {
         if self.items.tab == items::Tab::Items {
             self.ensure_items(file, window, cx);
         }
+    }
+
+    /// Points the title and description fields at the walk on show, once per walk, so a
+    /// reload of the same walk never overwrites what is being typed.
+    fn sync_details(
+        &mut self,
+        walk: Option<&crate::ux_walk_journal::Journal>,
+        cx: &mut Context<Self>,
+    ) {
+        let walk = walk.filter(|walk| renamable(walk));
+        let file = walk.map(crate::ux_walk_journal::Journal::file);
+        if file == self.details {
+            return;
+        }
+        self.details = file;
+        let (topic, description) = walk.map_or_else(Default::default, |walk| {
+            (walk.request.topic.clone(), walk.description.clone())
+        });
+        self.title.update(cx, |input, cx| input.set_text(topic, cx));
+        self.about
+            .update(cx, |input, cx| input.set_text(description, cx));
+    }
+
+    fn shown_walk(&self, cx: &App) -> Option<crate::ux_walk_journal::Journal> {
+        if self.selection.file.is_some() {
+            self.saved.clone()
+        } else {
+            self.session.read(cx).walk.journal.clone()
+        }
+    }
+
+    fn save_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file) = self.details.clone() else {
+            return;
+        };
+        let topic = self.title.read(cx).text().trim().to_string();
+        let description = self.about.read(cx).text().trim().to_string();
+        if self.shown_walk(cx).is_some_and(|walk| {
+            walk.file() == file && walk.request.topic == topic && walk.description == description
+        }) {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let renamed = file.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let journal =
+                        crate::ux_walk_library::rename_walk(&renamed, &topic, &description)?;
+                    let report = crate::ux_walk::run_engine("retitle", &renamed).err();
+                    Ok::<_, String>((journal, report))
+                })
+                .await;
+            this.update_in(cx, |this, _, cx| {
+                match result {
+                    Ok((journal, report)) => {
+                        let (topic, description) =
+                            (journal.request.topic.clone(), journal.description.clone());
+                        this.session.update(cx, |session, cx| {
+                            if let Some(walk) = session
+                                .walk
+                                .journal
+                                .as_mut()
+                                .filter(|walk| walk.file() == file)
+                            {
+                                walk.request.topic = topic.clone();
+                                walk.description = description.clone();
+                                cx.notify();
+                            }
+                        });
+                        if let Some(walk) = this.saved.as_mut().filter(|walk| walk.file() == file) {
+                            walk.request.topic = topic.clone();
+                            walk.description = description;
+                        }
+                        if let Some(summary) =
+                            this.summary.as_mut().filter(|summary| summary.file == file)
+                        {
+                            summary.topic = topic;
+                        }
+                        this.error = None;
+                        this.notice = Some(match report {
+                            None => "Title and description saved.".into(),
+                            Some(error) => format!(
+                                "Title and description saved. The report keeps its old title until you reprocess: {error}"
+                            ),
+                        });
+                        cx.defer(crate::app_windows::refresh_library_after_delete);
+                    }
+                    Err(error) => this.error = Some(error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn handoff(
@@ -728,12 +855,10 @@ impl Render for WalkWindow {
         self.theme.refresh(window, cx, false);
         let theme = self.theme;
         let saved_view = self.selection.file.is_some();
+        let walk = self.shown_walk(cx);
+        self.sync_details(walk.as_ref(), cx);
+        let editing_details = self.details.is_some();
         let session = self.session.read(cx);
-        let walk = if saved_view {
-            self.saved.clone()
-        } else {
-            session.walk.journal.clone()
-        };
         let notes = if saved_view {
             self.saved_notes.as_ref()
         } else {
@@ -804,16 +929,28 @@ impl Render for WalkWindow {
             .bg(theme.gray_1)
             .text_color(theme.text_primary)
             .font_family(crate::theme::UI_FONT)
-            .child(
-                div()
-                    .text_size(px(22.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child(
-                        walk.as_ref()
-                            .map(|walk| walk.request.topic.clone())
-                            .unwrap_or_else(|| fork_brand::WALK_MODE_NAME.into()),
-                    ),
-            )
+            .when(!editing_details, |this| {
+                this.child(
+                    div()
+                        .text_size(px(22.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(
+                            walk.as_ref()
+                                .map(|walk| walk.request.topic.clone())
+                                .unwrap_or_else(|| fork_brand::WALK_MODE_NAME.into()),
+                        ),
+                )
+            })
+            .when(editing_details, |this| {
+                this.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(ui::TextInput::settings(&theme, "walk-title", &self.title))
+                        .child(ui::TextInput::settings(&theme, "walk-about", &self.about)),
+                )
+            })
             .child(
                 div()
                     .text_size(px(12.))
@@ -1193,4 +1330,9 @@ impl Render for WalkWindow {
             .children(self.render_item_menu(cx))
             .children(self.render_project_menu(cx))
     }
+}
+
+/// A stopped walk or diatribe. Notes on an ordinary recording take that recording's name.
+fn renamable(walk: &crate::ux_walk_journal::Journal) -> bool {
+    walk.state != "recording" && !walk.request.is_notes()
 }
