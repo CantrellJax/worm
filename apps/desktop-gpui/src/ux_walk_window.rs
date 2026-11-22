@@ -203,8 +203,8 @@ struct WalkWindow {
     input: Entity<ui::TextInputState>,
     title: Entity<ui::TextInputState>,
     about: Entity<ui::TextInputState>,
-    /// The stopped recording whose title and description the two fields above show.
-    details: Option<std::path::PathBuf>,
+    details: Option<SavedDetails>,
+    saving: Option<gpui::Task<()>>,
     selection: crate::ux_walk_library::WalkSelection,
     saved: Option<crate::ux_walk_journal::Journal>,
     saved_notes: Option<LoadedNotes>,
@@ -295,13 +295,15 @@ impl WalkWindow {
             input.set_placeholder("Title");
             input
         });
-        cx.subscribe_in(&title, window, |this, _, event, window, cx| {
-            if matches!(
-                event,
-                ui::TextInputEvent::Confirmed | ui::TextInputEvent::Blurred
-            ) {
-                this.save_details(window, cx);
+        cx.subscribe(&title, |this, _, event, cx| match event {
+            ui::TextInputEvent::Confirmed | ui::TextInputEvent::Blurred => this.save_details(cx),
+            ui::TextInputEvent::Cancelled => {
+                if let Some(details) = &this.details {
+                    let topic = details.topic.clone();
+                    this.title.update(cx, |input, cx| input.set_text(topic, cx));
+                }
             }
+            ui::TextInputEvent::Changed => {}
         })
         .detach();
         let about = cx.new(|cx| {
@@ -309,10 +311,16 @@ impl WalkWindow {
             input.set_placeholder("What was this recording about?");
             input
         });
-        cx.subscribe_in(&about, window, |this, _, event, window, cx| {
-            if matches!(event, ui::TextInputEvent::Blurred) {
-                this.save_details(window, cx);
+        cx.subscribe(&about, |this, _, event, cx| match event {
+            ui::TextInputEvent::Blurred => this.save_details(cx),
+            ui::TextInputEvent::Cancelled => {
+                if let Some(details) = &this.details {
+                    let description = details.description.clone();
+                    this.about
+                        .update(cx, |input, cx| input.set_text(description, cx));
+                }
             }
+            ui::TextInputEvent::Changed | ui::TextInputEvent::Confirmed => {}
         })
         .detach();
         let items = items::ItemsState::new(window, cx);
@@ -324,6 +332,7 @@ impl WalkWindow {
             title,
             about,
             details: None,
+            saving: None,
             selection: Default::default(),
             saved: None,
             saved_notes: None,
@@ -382,13 +391,22 @@ impl WalkWindow {
     ) {
         let walk = walk.filter(|walk| renamable(walk));
         let file = walk.map(crate::ux_walk_journal::Journal::file);
-        if file == self.details {
+        if file.as_ref() == self.details.as_ref().map(|details| &details.file) {
             return;
         }
-        self.details = file;
-        let (topic, description) = walk.map_or_else(Default::default, |walk| {
-            (walk.request.topic.clone(), walk.description.clone())
+        // The shown walk can change before the field's blur arrives; keep what was typed.
+        self.save_details(cx);
+        self.details = walk.map(|walk| SavedDetails {
+            file: walk.file(),
+            topic: walk.request.topic.clone(),
+            description: walk.description.clone(),
         });
+        let (topic, description) = self
+            .details
+            .as_ref()
+            .map_or_else(Default::default, |details| {
+                (details.topic.clone(), details.description.clone())
+            });
         self.title.update(cx, |input, cx| input.set_text(topic, cx));
         self.about
             .update(cx, |input, cx| input.set_text(description, cx));
@@ -402,29 +420,44 @@ impl WalkWindow {
         }
     }
 
-    fn save_details(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(file) = self.details.clone() else {
+    /// Saves run one at a time, so Return followed by a blur never has two writers on the
+    /// journal's temp file.
+    fn save_details(&mut self, cx: &mut Context<Self>) {
+        let Some(details) = self.details.as_mut() else {
             return;
         };
-        let topic = self.title.read(cx).text().trim().to_string();
+        let mut topic = self.title.read(cx).text().trim().to_string();
         let description = self.about.read(cx).text().trim().to_string();
-        if self.shown_walk(cx).is_some_and(|walk| {
-            walk.file() == file && walk.request.topic == topic && walk.description == description
-        }) {
+        if topic.is_empty() {
+            topic = details.topic.clone();
+            let shown = topic.clone();
+            self.title.update(cx, |input, cx| input.set_text(shown, cx));
+        }
+        if topic == details.topic && description == details.description {
             return;
         }
-        cx.spawn_in(window, async move |this, cx| {
+        details.topic = topic.clone();
+        details.description = description.clone();
+        let file = details.file.clone();
+        let previous = self.saving.take();
+        self.saving = Some(cx.spawn(async move |this, cx| {
+            if let Some(previous) = previous {
+                previous.await;
+            }
             let renamed = file.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let journal =
                         crate::ux_walk_library::rename_walk(&renamed, &topic, &description)?;
-                    let report = crate::ux_walk::run_engine("retitle", &renamed).err();
+                    let report = crate::ux_walk::run_engine("retitle", &renamed).map(|output| {
+                        serde_json::from_str::<serde_json::Value>(&output)
+                            .is_ok_and(|value| value["pending"].as_bool() == Some(true))
+                    });
                     Ok::<_, String>((journal, report))
                 })
                 .await;
-            this.update_in(cx, |this, _, cx| {
+            this.update(cx, |this, cx| {
                 match result {
                     Ok((journal, report)) => {
                         let (topic, description) =
@@ -452,20 +485,34 @@ impl WalkWindow {
                         }
                         this.error = None;
                         this.notice = Some(match report {
-                            None => "Title and description saved.".into(),
-                            Some(error) => format!(
+                            Ok(false) => "Title and description saved.".into(),
+                            Ok(true) => "Title and description saved. The report shows the new title when the current processing finishes.".into(),
+                            Err(error) => format!(
                                 "Title and description saved. The report keeps its old title until you reprocess: {error}"
                             ),
                         });
                         cx.defer(crate::app_windows::refresh_library_after_delete);
                     }
-                    Err(error) => this.error = Some(error),
+                    Err(error) => {
+                        // Forget the optimistic copy so the next blur tries again.
+                        let stored = this
+                            .shown_walk(cx)
+                            .filter(|walk| walk.file() == file)
+                            .map(|walk| (walk.request.topic, walk.description));
+                        if let (Some(details), Some((topic, description))) = (
+                            this.details.as_mut().filter(|details| details.file == file),
+                            stored,
+                        ) {
+                            details.topic = topic;
+                            details.description = description;
+                        }
+                        this.error = Some(error);
+                    }
                 }
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        }));
     }
 
     fn handoff(
@@ -1330,6 +1377,13 @@ impl Render for WalkWindow {
             .children(self.render_item_menu(cx))
             .children(self.render_project_menu(cx))
     }
+}
+
+/// The title and description as last saved for the walk the fields show.
+struct SavedDetails {
+    file: std::path::PathBuf,
+    topic: String,
+    description: String,
 }
 
 /// A stopped walk or diatribe. Notes on an ordinary recording take that recording's name.

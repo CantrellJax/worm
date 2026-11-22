@@ -19,7 +19,8 @@ pub struct WalkState {
     pub checkpoint_notice: String,
     pub note_draft: String,
     /// Stop handed this recording to the walk window. Taken by the phase observer, which
-    /// then leaves the recorder hidden so the finish does not read as "record again".
+    /// leaves the recorder hidden so the finish does not read as "record again", and clears
+    /// the recorder topic this walk used.
     pub finished: bool,
     pub(super) restarting: bool,
     checkpoint_monitor: Option<Task<()>>,

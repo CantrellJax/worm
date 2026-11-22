@@ -279,6 +279,22 @@ impl DiatribeMicrophone {
 }
 
 impl MainWindow {
+    /// The topic belonged to the walk that just finished; the next walk starts without it.
+    pub(crate) fn forget_walk_topic(&mut self, used: &str, cx: &mut Context<Self>) {
+        if self.walk.topic.read(cx).text().trim() != used {
+            return;
+        }
+        self.walk
+            .topic
+            .update(cx, |input, cx| input.set_text("", cx));
+        crate::store::set_store_setting(
+            crate::store::RECORDING_SETTINGS,
+            "uxWalkTopic",
+            serde_json::Value::String(String::new()),
+        );
+        cx.notify();
+    }
+
     pub(super) fn diatribe_microphone(&self) -> DiatribeMicrophone {
         DiatribeMicrophone::resolve(
             self.microphone.is_some(),

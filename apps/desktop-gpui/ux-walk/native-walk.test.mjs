@@ -226,7 +226,7 @@ test("a rename reaches the session and report without reprocessing, even mid-pro
 			processChapter: async () => {
 				f.journal.request.topic = "Renamed while processing";
 				f.save();
-				assert.deepEqual(await retitleNativeWalk(f.file), {
+				assert.deepEqual(await retitleNativeWalk(f.file, { waitMs: 0 }), {
 					applied: false,
 					pending: true,
 				});
@@ -2182,4 +2182,63 @@ test("a failing refresh does not demote a ready walk", async (t) => {
 		},
 	});
 	assert.equal(f.status().state, "ready");
+});
+
+test("a rename that finds the walk busy lands when voice naming, an item retry or a failed run lets go", async (t) => {
+	const f = await walkWithoutItems(t);
+	const session = () => JSON.parse(f.read("session.json"));
+	const renameWhileBusy = async (topic) => {
+		f.journal.request.topic = topic;
+		f.save();
+		assert.deepEqual(await retitleNativeWalk(f.file, { waitMs: 0 }), {
+			applied: false,
+			pending: true,
+		});
+	};
+
+	fs.writeFileSync(
+		path.join(f.directory, "voices.json"),
+		JSON.stringify({
+			schemaVersion: 1,
+			inputHash: "lineup",
+			voices: [{ id: "voice-1", label: "Speaker 1" }],
+		}),
+	);
+	let relabelled = 0;
+	await nameWalkVoices(f.file, { "voice-1": "Ann" }, f.cfg, {
+		processChapter: async () => {
+			relabelled++;
+			await renameWhileBusy("Named voices");
+			return {};
+		},
+		writeIndex: () => {},
+	});
+	assert.equal(relabelled, 1);
+	assert.equal(session().topic, "Named voices");
+	assert.match(f.read("report.html"), /<h1>Named voices<\/h1>/);
+
+	await retryWalkItems(f.file, f.cfg, {
+		runBrief: async () => {
+			await renameWhileBusy("Retried items");
+			throw new Error("offline");
+		},
+	});
+	assert.equal(session().topic, "Retried items");
+	assert.match(f.read("report.html"), /<h1>Retried items<\/h1>/);
+
+	fs.rmSync(path.join(f.directory, "processing.json"));
+	fs.rmSync(path.join(f.directory, "media/export.json"));
+	await assert.rejects(
+		finishNativeWalk(f.file, f.cfg, {
+			client: {
+				export: async () => {
+					await renameWhileBusy("Failed run");
+					throw new Error("export failed");
+				},
+			},
+		}),
+		/export failed/,
+	);
+	assert.equal(session().topic, "Failed run");
+	assert.match(f.read("report.html"), /<h1>Failed run<\/h1>/);
 });

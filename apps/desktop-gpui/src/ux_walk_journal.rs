@@ -91,7 +91,6 @@ pub struct Journal {
     pub state: String,
     pub duration_ms: Option<u64>,
     pub events: Vec<Event>,
-    /// What the recording was about, in the owner's words, written once it has stopped.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
 }
