@@ -64,7 +64,7 @@ All JSON is bounded. Writes require `Authorization: Bearer <owner-upload-credent
 | GET /rewind/ID | Replay page for a report's rewind. The page holds no report data; it asks for the owner credential and reads the rewind with it |
 | DELETE /api/v1/feedback/ID | Owner: delete the report and its attachments |
 
-Link previews are generic by default: a request without the key learns nothing about a share. A preview card is opt-in per share and publishes the share's title and that image to anyone who has the link's path, even without the key; delete the card or revoke the share to take them back.
+Link previews are generic by default: a request without the key learns nothing about a share. A preview card is opt-in per share and publishes the share's title and that image to anyone who has the link's path, even without the key. Deleting the card or revoking the share stops new previews; chat apps keep their own copy of a preview they already showed.
 
 Playback URL for another app's video player: share link `https://HOST/s/ID#TOKEN` becomes `https://HOST/api/v1/shares/ID/media?token=TOKEN`. The token is a bearer capability in the URL, so keep it out of logs. The viewer page is still not embeddable.
 

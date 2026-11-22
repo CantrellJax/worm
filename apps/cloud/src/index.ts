@@ -306,9 +306,9 @@ async function liveCard(
 			? (await env.MEDIA.head(`cards/${id}`))?.httpMetadata?.contentType
 			: undefined;
 		return type ? { share, type } : undefined;
-	} catch (error) {
-		if (error instanceof HttpError) return;
-		throw error;
+	} catch {
+		// A storage error must not fail the viewer page for people who hold the key.
+		return undefined;
 	}
 }
 
