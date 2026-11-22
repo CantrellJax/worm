@@ -424,6 +424,9 @@ export async function nameWalkVoices(
 	}
 }
 
+// A retitle or a voice-name save holds the lock for milliseconds; a run that starts just then
+// waits for it instead of failing the walk as busy.
+const BRIEF_HOLD_MS = 3000;
 const ITEMS_MARKER = /<!--items-notice-->[\s\S]*?<!--\/items-notice-->/;
 const MIN_BRIEF_S = 20;
 
@@ -509,7 +512,7 @@ export async function retryWalkItems(file, loaded, dependencies = {}) {
 	const journal = readJournal(file);
 	const { cfg } = withRecordingProject(journal, loaded);
 	const lease = await holdProcessing(file, journal.request.directory, {
-		waitMs: dependencies.waitMs ?? 0,
+		waitMs: dependencies.waitMs ?? BRIEF_HOLD_MS,
 	});
 	try {
 		return await refreshItems(file, cfg, { retry: true, dependencies });
@@ -638,8 +641,11 @@ function applyWalkTitle(file) {
 // that finds the walk busy reaches the session and report when the holder finishes.
 async function holdProcessing(file, directory, options) {
 	const lease = await acquireWalkLock(directory, "processing", options);
+	let released = false;
 	return {
 		async release() {
+			if (released) return;
+			released = true;
 			try {
 				applyWalkTitle(file);
 			} catch {}
@@ -648,10 +654,13 @@ async function holdProcessing(file, directory, options) {
 	};
 }
 
-// Renames a processed recording without reprocessing it. The short wait covers a holder that
-// read the journal just before the rename and is already letting go.
+// Renames a processed recording without reprocessing it. Before the first processing run there
+// is nothing to patch, and that run reads the title from the journal. The short wait covers a
+// holder that read the journal just before the rename and is already letting go.
 export async function retitleNativeWalk(file, { waitMs = 2000 } = {}) {
 	const directory = readJournal(file, { complete: false }).request.directory;
+	if (!fs.existsSync(path.join(directory, "session.json")))
+		return { applied: false, pending: false };
 	let lease;
 	try {
 		lease = await acquireWalkLock(directory, "processing", { waitMs });
@@ -673,7 +682,7 @@ export async function finishNativeWalk(file, loaded, dependencies = {}) {
 	const processingLease = await holdProcessing(file, directory, {
 		waitMs: dependencies.reconcileStopTail
 			? (dependencies.reconcileWaitMs ?? 150000)
-			: 0,
+			: (dependencies.waitMs ?? BRIEF_HOLD_MS),
 	});
 	const stages = {};
 	let processingOwned = true;
@@ -1278,6 +1287,7 @@ export async function finishNativeWalk(file, loaded, dependencies = {}) {
 				completedAt: Date.now(),
 			});
 		}
+		applyWalkTitle(file);
 		progress("ready", null, {
 			...(stages.transcript === "disabled"
 				? {}

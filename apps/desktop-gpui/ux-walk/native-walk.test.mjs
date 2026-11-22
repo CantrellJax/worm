@@ -16,6 +16,7 @@ import {
 	snapshotNativeWalk,
 } from "./native-walk.mjs";
 import { walkModeName } from "./walk-brand.mjs";
+import { acquireWalkLock } from "./walk-lock.mjs";
 
 function fixture(t) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ux-walk-native-"));
@@ -208,6 +209,43 @@ test("a partial failed export cannot block a retry or replace the source", async
 	assert.ok(report.includes("Payment"));
 	assert.ok(report.includes("video.mp4"));
 	assert.ok(report.includes(` · ${walkModeName}</title>`));
+});
+
+test("a rename as processing starts neither waits on the lock nor fails the walk", async (t) => {
+	const f = fixture(t);
+	const lease = await acquireWalkLock(f.directory, "processing");
+	const letGo = new Promise((resolve) =>
+		setTimeout(() => resolve(lease.release()), 300),
+	);
+	try {
+		assert.deepEqual(await retitleNativeWalk(f.file, { waitMs: 0 }), {
+			applied: false,
+			pending: false,
+		});
+		await finishNativeWalk(
+			f.file,
+			{ transcriber: "none", brief: false },
+			{
+				client: {
+					export: async (_project, output) => {
+						fs.writeFileSync(output, "export");
+						return { durationS: 10 };
+					},
+				},
+				clip: async (_input, output) => fs.writeFileSync(output, "clip"),
+				processChapter: async () => ({}),
+				writeIndex: () => {},
+				writeReport: () => {},
+			},
+		);
+	} finally {
+		await letGo;
+	}
+	assert.equal(
+		JSON.parse(fs.readFileSync(path.join(f.directory, "processing.json")))
+			.state,
+		"ready",
+	);
 });
 
 test("a rename reaches the session and report without reprocessing, even mid-processing", async (t) => {

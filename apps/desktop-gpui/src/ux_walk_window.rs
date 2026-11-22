@@ -205,6 +205,7 @@ struct WalkWindow {
     about: Entity<ui::TextInputState>,
     details: Option<SavedDetails>,
     saving: Option<gpui::Task<()>>,
+    save_revision: u64,
     selection: crate::ux_walk_library::WalkSelection,
     saved: Option<crate::ux_walk_journal::Journal>,
     saved_notes: Option<LoadedNotes>,
@@ -333,6 +334,7 @@ impl WalkWindow {
             about,
             details: None,
             saving: None,
+            save_revision: 0,
             selection: Default::default(),
             saved: None,
             saved_notes: None,
@@ -439,6 +441,8 @@ impl WalkWindow {
         details.topic = topic.clone();
         details.description = description.clone();
         let file = details.file.clone();
+        self.save_revision = self.save_revision.wrapping_add(1);
+        let revision = self.save_revision;
         let previous = self.saving.take();
         self.saving = Some(cx.spawn(async move |this, cx| {
             if let Some(previous) = previous {
@@ -458,10 +462,24 @@ impl WalkWindow {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                // A queued newer save owns the saved copy, and only the walk on show reports.
+                let latest = this.save_revision == revision;
+                let shown = this
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details.file == file);
                 match result {
                     Ok((journal, report)) => {
                         let (topic, description) =
                             (journal.request.topic.clone(), journal.description.clone());
+                        if let Some(details) = this
+                            .details
+                            .as_mut()
+                            .filter(|details| latest && details.file == file)
+                        {
+                            details.topic = topic.clone();
+                            details.description = description.clone();
+                        }
                         this.session.update(cx, |session, cx| {
                             if let Some(walk) = session
                                 .walk
@@ -483,21 +501,23 @@ impl WalkWindow {
                         {
                             summary.topic = topic;
                         }
-                        this.error = None;
-                        this.notice = Some(match report {
-                            Ok(false) => "Title and description saved.".into(),
-                            Ok(true) => "Title and description saved. The report shows the new title when the current processing finishes.".into(),
-                            Err(error) => format!(
-                                "Title and description saved. The report keeps its old title until you reprocess: {error}"
-                            ),
-                        });
+                        if shown {
+                            this.error = None;
+                            this.notice = Some(match report {
+                                Ok(false) => "Title and description saved.".into(),
+                                Ok(true) => "Title and description saved. The report shows the new title when the current processing finishes.".into(),
+                                Err(error) => format!(
+                                    "Title and description saved. The report keeps its old title until you reprocess: {error}"
+                                ),
+                            });
+                        }
                         cx.defer(crate::app_windows::refresh_library_after_delete);
                     }
                     Err(error) => {
                         // Forget the optimistic copy so the next blur tries again.
                         let stored = this
                             .shown_walk(cx)
-                            .filter(|walk| walk.file() == file)
+                            .filter(|walk| latest && walk.file() == file)
                             .map(|walk| (walk.request.topic, walk.description));
                         if let (Some(details), Some((topic, description))) = (
                             this.details.as_mut().filter(|details| details.file == file),
@@ -506,7 +526,9 @@ impl WalkWindow {
                             details.topic = topic;
                             details.description = description;
                         }
-                        this.error = Some(error);
+                        if shown {
+                            this.error = Some(error);
+                        }
                     }
                 }
                 cx.notify();
