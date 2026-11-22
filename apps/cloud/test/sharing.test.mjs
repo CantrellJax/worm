@@ -536,46 +536,46 @@ test("the viewer adds a captions track only when the share has captions", async 
 	const id = "11111111-2222-3333-4444-555555555555";
 	const run = async (captions, contentType = "video/mp4") => {
 		const appended = [];
-		const elements = {};
-		const element = (name) =>
-			(elements[name] ??= {
-				textContent: "",
-				hidden: true,
-				append: (track) => appended.push(track),
-			});
+		// openShare ends by un-hiding the media element, so that is the signal it is done.
+		let finish;
 		const done = new Promise((resolve) => {
-			const fetch = async (url) =>
-				url.endsWith("/metadata")
-					? {
-							ok: true,
-							json: async () => ({
-								title: "T",
-								contentType,
-								expiresAt: 1,
-								captions,
-							}),
-						}
-					: { ok: true };
-			vm.runInNewContext(
-				readFileSync(new URL("../public/viewer.js", import.meta.url), "utf8"),
-				{
-					location: { pathname: `/s/${id}`, hash: "#abc" },
-					document: {
-						title: "",
-						getElementById: (name) => {
-							if (name === "video" || name === "image") setTimeout(resolve, 0);
-							return element(name);
-						},
-						createElement: () => ({}),
-					},
-					fetch,
-					Object,
-					Date,
-				},
-			);
+			finish = resolve;
 		});
+		const media = {
+			append: (track) => appended.push(track),
+			set hidden(value) {
+				if (value === false) finish();
+			},
+		};
+		const text = () => ({ textContent: "" });
+		const fetch = async (url) =>
+			url.endsWith("/metadata")
+				? {
+						ok: true,
+						json: async () => ({
+							title: "T",
+							contentType,
+							expiresAt: 1,
+							captions,
+						}),
+					}
+				: { ok: true };
+		vm.runInNewContext(
+			readFileSync(new URL("../public/viewer.js", import.meta.url), "utf8"),
+			{
+				location: { pathname: `/s/${id}`, hash: "#abc" },
+				document: {
+					title: "",
+					getElementById: (name) =>
+						name === "video" || name === "image" ? media : text(),
+					createElement: () => ({}),
+				},
+				fetch,
+				Object,
+				Date,
+			},
+		);
 		await done;
-		await new Promise((resolve) => setTimeout(resolve, 20));
 		return appended;
 	};
 	const [track] = await run(true);
@@ -592,6 +592,49 @@ test("the viewer adds a captions track only when the share has captions", async 
 	assert.deepEqual(await run(false), []);
 	assert.deepEqual(await run(undefined), []);
 	assert.deepEqual(await run(true, "image/png"), []);
+});
+
+test("captions uploaded while the share is being revoked are not kept", async () => {
+	const share = await create(new Uint8Array([1, 2, 3]));
+	const path = `/api/v1/shares/${share.id}`;
+	const encoder = new TextEncoder();
+	let release;
+	const gate = new Promise((resolve) => {
+		release = resolve;
+	});
+	let started;
+	const begun = new Promise((resolve) => {
+		started = resolve;
+	});
+	const body = new ReadableStream({
+		async start(controller) {
+			controller.enqueue(encoder.encode("WEBVTT\n\n"));
+			started();
+			await gate;
+			controller.enqueue(encoder.encode("00:00.000 --> 00:01.000\nlate\n"));
+			controller.close();
+		},
+	});
+	const pending = request(`${path}/captions`, {
+		method: "PUT",
+		headers,
+		body,
+		duplex: "half",
+	});
+	await begun;
+	// The request must be past its share lookup and waiting on the body, so the
+	// revoke lands mid-upload. Nothing observable marks that, hence a short wait; if
+	// it were too short the PUT would 404 at the lookup and the test would pass
+	// without the fix, so the mutation check in the PR notes matters.
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	assert.equal(
+		(await request(path, { method: "DELETE", headers })).status,
+		204,
+	);
+	release();
+	assert.equal((await pending).status, 404);
+	const bucket = await runtime.getR2Bucket("MEDIA");
+	assert.equal(await bucket.head(`captions/${share.id}`), null);
 });
 
 test("the cloud home page works with exact HTML asset routing", async () => {

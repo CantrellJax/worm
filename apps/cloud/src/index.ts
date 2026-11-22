@@ -232,7 +232,9 @@ async function putCaptions(
 	const bytes = await boundedBody(request, CAPTIONS_LIMIT);
 	let text: string;
 	try {
-		text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+		text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+			bytes,
+		);
 	} catch {
 		throw new HttpError(400, "Captions must be UTF-8 WebVTT.");
 	}
@@ -241,6 +243,11 @@ async function putCaptions(
 	await env.MEDIA.put(`captions/${share.id}`, bytes, {
 		httpMetadata: { contentType: "text/vtt; charset=utf-8" },
 	});
+	// A revoke that landed while the body streamed has already deleted captions/ID.
+	if (await env.MEDIA.head(`revoked/${share.id}`)) {
+		await env.MEDIA.delete(`captions/${share.id}`);
+		throw new HttpError(404, "Share unavailable.");
+	}
 	return new Response(null, { status: 204 });
 }
 
