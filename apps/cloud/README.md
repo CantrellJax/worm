@@ -49,7 +49,9 @@ All JSON is bounded. Writes require `Authorization: Bearer <owner-upload-credent
 | PUT /api/v1/shares/ID/parts/N | Upload exactly the declared part size (final part can be smaller); return partNumber and etag |
 | POST /api/v1/shares/ID/complete | Accept ordered parts; validate final size before publishing |
 | DELETE /api/v1/shares/ID | Revoke access and remove the published media or abort an incomplete upload |
-| GET /api/v1/shares/ID/metadata | Read title, size, content type and expiry with a read capability |
+| GET /api/v1/shares/ID/metadata | Read title, size, content type, expiry and whether captions exist with a read capability |
+| PUT /api/v1/shares/ID/captions | Owner: store WebVTT captions (UTF-8, starting `WEBVTT`, at most 256 KiB) for a published video; replaces any earlier ones. DELETE removes them |
+| GET /api/v1/shares/ID/captions | Captions as `text/vtt` with the same read capability as the media. The viewer adds them as a `<track kind="captions">` when metadata says `captions: true` |
 | GET or HEAD /api/v1/shares/ID/media | Authorized media; single byte ranges supported. Also accepts `?token=READ_TOKEN` for a cross-origin `<video src>` |
 | POST /api/v1/shares/ID/access | Exchange the read capability for a scoped HttpOnly playback cookie bounded by link expiry |
 | GET /s/ID#READ_CAPABILITY | Viewer; the fragment is exchanged for playback access and never sent in the HTTP URL |

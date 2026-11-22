@@ -401,6 +401,199 @@ test("the viewer script drops stray characters from the id and the key before us
 	assert.equal(calls[0].auth, `Bearer ${key}`);
 });
 
+const vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello there.\n";
+
+test("captions: only the owner writes them, readers need the same access as the video, and the metadata says they exist", async () => {
+	const share = await create(new Uint8Array([1, 2, 3]));
+	const path = `/api/v1/shares/${share.id}`;
+	const token = share.sharePath.split("#")[1];
+	const read = { Authorization: `Bearer ${token}` };
+	const metadata = async () =>
+		(await request(`${path}/metadata`, { headers: read })).json();
+	assert.equal((await metadata()).captions, false);
+	assert.equal(
+		(await request(`${path}/captions`, { headers: read })).status,
+		404,
+	);
+
+	const put = (extra, body = vtt) =>
+		request(`${path}/captions`, {
+			method: "PUT",
+			headers: { "Content-Type": "text/vtt", ...extra },
+			body,
+		});
+	// Not the owner: no credential, a wrong one, or the read capability.
+	assert.equal((await put({})).status, 401);
+	assert.equal((await put({ Authorization: "Bearer wrong" })).status, 401);
+	assert.equal((await put(read)).status, 401);
+	assert.equal((await metadata()).captions, false);
+
+	// Owner of another share record is refused like any foreign share.
+	const bucket = await runtime.getR2Bucket("MEDIA");
+	const record = await (await bucket.get(`shares/${share.id}.json`)).json();
+	await bucket.put(
+		`shares/${share.id}.json`,
+		JSON.stringify({ ...record, owner: "someone-else" }),
+	);
+	assert.equal((await put(headers)).status, 404);
+	await bucket.put(`shares/${share.id}.json`, JSON.stringify(record));
+
+	// Content that is not UTF-8 WebVTT, or too large, is refused.
+	assert.equal((await put(headers, "<html>")).status, 400);
+	assert.equal(
+		(await put(headers, new Uint8Array([0x57, 0xff, 0xfe]))).status,
+		400,
+	);
+	assert.equal(
+		(await put(headers, `WEBVTT\n${"a".repeat(256 * 1024)}`)).status,
+		413,
+	);
+	assert.equal((await metadata()).captions, false);
+
+	assert.equal((await put(headers)).status, 204);
+	assert.equal((await metadata()).captions, true);
+
+	// Reading needs the same access as the video, by bearer or by cookie.
+	assert.equal((await request(`${path}/captions`)).status, 404);
+	assert.equal(
+		(
+			await request(`${path}/captions`, {
+				headers: { Authorization: "Bearer wrong" },
+			})
+		).status,
+		404,
+	);
+	const bearerRead = await request(`${path}/captions`, { headers: read });
+	assert.equal(bearerRead.status, 200);
+	assert.equal(
+		bearerRead.headers.get("Content-Type"),
+		"text/vtt; charset=utf-8",
+	);
+	assert.equal(await bearerRead.text(), vtt);
+	const access = await request(`${path}/access`, {
+		method: "POST",
+		headers: read,
+	});
+	const cookie = { Cookie: access.headers.get("Set-Cookie").split(";")[0] };
+	assert.equal(
+		(await request(`${path}/captions`, { headers: cookie })).status,
+		200,
+	);
+	assert.equal(
+		(await request(`${path}/captions`, { method: "DELETE", headers: cookie }))
+			.status,
+		401,
+	);
+
+	// The owner can remove them without revoking the video; revoking removes them too.
+	assert.equal(
+		(await request(`${path}/captions`, { method: "DELETE", headers })).status,
+		204,
+	);
+	assert.equal((await metadata()).captions, false);
+	assert.equal((await put(headers)).status, 204);
+	assert.equal(
+		(await request(path, { method: "DELETE", headers })).status,
+		204,
+	);
+	assert.equal(await bucket.head(`captions/${share.id}`), null);
+	assert.equal(
+		(await request(`${path}/captions`, { headers: read })).status,
+		404,
+	);
+	assert.equal((await put(headers)).status, 404);
+});
+
+test("captions need a finished video share", async () => {
+	const pending = await request("/api/v1/shares", {
+		method: "POST",
+		headers,
+		body: JSON.stringify({
+			title: "pending",
+			contentType: "video/mp4",
+			size: 5,
+		}),
+	});
+	const { id } = await pending.json();
+	const early = await request(`/api/v1/shares/${id}/captions`, {
+		method: "PUT",
+		headers,
+		body: vtt,
+	});
+	assert.equal(early.status, 409);
+	const image = await create(new Uint8Array([1, 2, 3]), {
+		contentType: "image/png",
+	});
+	const late = await request(`/api/v1/shares/${image.id}/captions`, {
+		method: "PUT",
+		headers,
+		body: vtt,
+	});
+	assert.equal(late.status, 409);
+});
+
+test("the viewer adds a captions track only when the share has captions", async () => {
+	const id = "11111111-2222-3333-4444-555555555555";
+	const run = async (captions, contentType = "video/mp4") => {
+		const appended = [];
+		const elements = {};
+		const element = (name) =>
+			(elements[name] ??= {
+				textContent: "",
+				hidden: true,
+				append: (track) => appended.push(track),
+			});
+		const done = new Promise((resolve) => {
+			const fetch = async (url) =>
+				url.endsWith("/metadata")
+					? {
+							ok: true,
+							json: async () => ({
+								title: "T",
+								contentType,
+								expiresAt: 1,
+								captions,
+							}),
+						}
+					: { ok: true };
+			vm.runInNewContext(
+				readFileSync(new URL("../public/viewer.js", import.meta.url), "utf8"),
+				{
+					location: { pathname: `/s/${id}`, hash: "#abc" },
+					document: {
+						title: "",
+						getElementById: (name) => {
+							if (name === "video" || name === "image") setTimeout(resolve, 0);
+							return element(name);
+						},
+						createElement: () => ({}),
+					},
+					fetch,
+					Object,
+					Date,
+				},
+			);
+		});
+		await done;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		return appended;
+	};
+	const [track] = await run(true);
+	assert.deepEqual(
+		{ ...track },
+		{
+			kind: "captions",
+			label: "English",
+			srclang: "en",
+			src: `/api/v1/shares/${id}/captions`,
+			default: true,
+		},
+	);
+	assert.deepEqual(await run(false), []);
+	assert.deepEqual(await run(undefined), []);
+	assert.deepEqual(await run(true, "image/png"), []);
+});
+
 test("the cloud home page works with exact HTML asset routing", async () => {
 	const result = await request("/", { redirect: "manual" });
 	assert.equal(result.status, 200);
