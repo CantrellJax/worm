@@ -23,6 +23,7 @@ interface Share {
 	uploadId: string;
 	expiresAt: number;
 	ready: boolean;
+	pageCsp?: string;
 }
 
 const PART_SIZE = 8 * 1024 * 1024;
@@ -41,6 +42,7 @@ const REWIND_CSP =
 const rewindPage = (pathname: string) =>
 	pathname.startsWith("/rewind/") &&
 	FEEDBACK_ID.test(pathname.slice("/rewind/".length));
+const PAGE_RESPONSE_PATH = /^\/api\/v1\/shares\/[a-f0-9-]{36}\/(?:page|media)$/;
 const VIEWER_PATH = /^\/s\/([a-f0-9-]{36})$/;
 const CARD_PATH = /^\/s\/([a-f0-9-]{36})\/card$/;
 const PAGE_TYPE = "text/html";
@@ -245,7 +247,9 @@ async function media(
 	await readable(
 		request,
 		share,
-		new URL(request.url).searchParams.get("token") ?? "",
+		share.contentType === PAGE_TYPE
+			? ""
+			: (new URL(request.url).searchParams.get("token") ?? ""),
 	);
 	const range =
 		request.method === "HEAD"
@@ -288,19 +292,43 @@ async function servePage(
 	share: Share,
 ): Promise<Response> {
 	await readable(request, share);
-	if (share.contentType !== PAGE_TYPE)
+	if (share.contentType !== PAGE_TYPE || !share.pageCsp)
 		throw new HttpError(404, "Share unavailable.");
+	const object =
+		request.method === "HEAD"
+			? await env.MEDIA.head(`media/${share.id}`)
+			: await env.MEDIA.get(`media/${share.id}`);
+	if (!object) throw new HttpError(404, "Share unavailable.");
+	return new Response(
+		"body" in object && object.body instanceof ReadableStream
+			? object.body
+			: null,
+		{
+			headers: {
+				"Content-Type": "text/html; charset=utf-8",
+				"Content-Length": `${object.size}`,
+				"Content-Security-Policy": share.pageCsp,
+				"X-Frame-Options": "DENY",
+				"Cross-Origin-Opener-Policy": "same-origin",
+			},
+		},
+	);
+}
+
+async function publishPage(env: RuntimeEnv, share: Share): Promise<void> {
 	const object = await env.MEDIA.get(`media/${share.id}`);
 	if (!object) throw new HttpError(404, "Share unavailable.");
-	const html = new TextDecoder().decode(await object.arrayBuffer());
-	return new Response(request.method === "HEAD" ? null : html, {
-		headers: {
-			"Content-Type": "text/html; charset=utf-8",
-			"Content-Security-Policy": pageCsp(await inlineScriptHashes(html)),
-			"X-Frame-Options": "DENY",
-			"Cross-Origin-Opener-Policy": "same-origin",
-		},
-	});
+	let html: string;
+	try {
+		html = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+			await object.arrayBuffer(),
+		);
+	} catch {
+		await env.MEDIA.put(`revoked/${share.id}`, "revoked");
+		await env.MEDIA.delete(`media/${share.id}`);
+		throw new HttpError(415, "An HTML page must be UTF-8.");
+	}
+	share.pageCsp = pageCsp(await inlineScriptHashes(html));
 }
 
 async function putCaptions(
@@ -560,6 +588,7 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 			if (object.size !== share.size)
 				throw new HttpError(409, "Uploaded size does not match.");
 			await load(env, id);
+			if (share.contentType === PAGE_TYPE) await publishPage(env, share);
 			share.ready = true;
 			await env.MEDIA.put(`shares/${id}.json`, JSON.stringify(share));
 			return response({ id, ready: true });
@@ -567,10 +596,14 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 		if (request.method === "POST" && action === "access") {
 			const token = await readable(request, share);
 			const secure = url.protocol === "https:" ? "; Secure" : "";
+			const lifetime =
+				share.contentType === PAGE_TYPE
+					? ""
+					: `; Max-Age=${Math.floor((share.expiresAt - Date.now()) / 1000)}`;
 			return new Response(null, {
 				status: 204,
 				headers: {
-					"Set-Cookie": `capux_read=${token}; Path=/api/v1/shares/${id}/; HttpOnly${secure}; SameSite=Strict; Max-Age=${Math.floor((share.expiresAt - Date.now()) / 1000)}`,
+					"Set-Cookie": `capux_read=${token}; Path=/api/v1/shares/${id}/; HttpOnly${secure}; SameSite=Strict${lifetime}`,
 				},
 			});
 		}
@@ -647,10 +680,16 @@ export default {
 		secured.headers.set("Cache-Control", "private, no-store");
 		secured.headers.set("Referrer-Policy", "no-referrer");
 		secured.headers.set("X-Content-Type-Options", "nosniff");
-		if (!secured.headers.has("Content-Security-Policy"))
+		const pathname = new URL(request.url).pathname;
+		if (
+			!(
+				PAGE_RESPONSE_PATH.test(pathname) &&
+				result.headers.has("Content-Security-Policy")
+			)
+		)
 			secured.headers.set(
 				"Content-Security-Policy",
-				rewindPage(new URL(request.url).pathname) ? REWIND_CSP : CSP,
+				rewindPage(pathname) ? REWIND_CSP : CSP,
 			);
 		return secured;
 	},

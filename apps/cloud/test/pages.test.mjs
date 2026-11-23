@@ -59,7 +59,7 @@ async function prepare(options) {
 }
 
 async function upload(html, options = {}) {
-	const bytes = encoder.encode(html);
+	const bytes = typeof html === "string" ? encoder.encode(html) : html;
 	const created = await prepare({
 		contentType: "text/html",
 		size: bytes.length,
@@ -125,8 +125,7 @@ test("type allowlist: an HTML page is accepted up to 8 MiB, other active content
 		assert.equal((await prepare({ contentType, size: 4 })).status, 400);
 	}
 	assert.equal(
-		(await prepare({ contentType: "video/mp4", size: PAGE_LIMIT + 1 }))
-			.status,
+		(await prepare({ contentType: "video/mp4", size: PAGE_LIMIT + 1 })).status,
 		201,
 	);
 });
@@ -172,7 +171,7 @@ test("page: the link's cookie opens the page as itself, with a page-specific CSP
 	assert.equal(
 		policy["script-src"],
 		[
-			sha256('document.body.dataset.ready="1"'),
+			"'sha256-7ojRbDWqyPt+sb9vni7FhiPAHN+fpbhkaPv2JPdLivg='",
 			sha256("\nwindow.answer = 42;\n"),
 		].join(" "),
 	);
@@ -185,6 +184,14 @@ test("page: the link's cookie opens the page as itself, with a page-specific CSP
 		headers: share.cookie,
 	});
 	assert.equal(head.status, 200);
+	assert.equal(
+		head.headers.get("Content-Length"),
+		`${encoder.encode(synthetic).length}`,
+	);
+	assert.equal(
+		head.headers.get("Content-Security-Policy"),
+		response.headers.get("Content-Security-Policy"),
+	);
 	assert.equal((await head.arrayBuffer()).byteLength, 0);
 });
 
@@ -229,7 +236,17 @@ test("page: only a holder of the link reads it, never from a URL token, and othe
 		).status,
 		200,
 	);
-	const media = await request(`${share.path}/media?token=${share.token}`);
+	assert.equal(
+		(await request(`${share.path}/media?token=${share.token}`)).status,
+		404,
+	);
+	assert.equal(
+		(await request(`${share.path}/page`, { method: "HEAD" })).status,
+		404,
+	);
+	const media = await request(`${share.path}/media`, {
+		headers: { Authorization: `Bearer ${share.token}` },
+	});
 	assert.equal(media.status, 200);
 	assert.equal(media.headers.get("Content-Disposition"), "attachment");
 	assert.equal(
@@ -264,13 +281,12 @@ test("page: only a holder of the link reads it, never from a URL token, and othe
 	);
 });
 
-test("page: a 1-day link expires with its cookie and revoking it closes the page at once", async () => {
+test("page: a 1-day link expires, its cookie ends with the browser session, and revoking it closes the page at once", async () => {
 	const before = Date.now();
 	const share = await upload("<p>Synthetic</p>", { expiresInDays: 1 });
 	assert.ok(share.expiresAt >= before + 86400000);
 	assert.ok(share.expiresAt <= Date.now() + 86400000);
-	const maxAge = Number(/Max-Age=(\d+)/.exec(share.setCookie)[1]);
-	assert.ok(maxAge > 86000 && maxAge <= 86400);
+	assert.doesNotMatch(share.setCookie, /Max-Age|Expires/);
 	assert.match(share.setCookie, /HttpOnly; Secure; SameSite=Strict/);
 	assert.match(share.setCookie, new RegExp(`Path=${share.path}/`));
 
@@ -280,8 +296,7 @@ test("page: a 1-day link expires with its cookie and revoking it closes the page
 	manifest.expiresAt = Date.now() - 1;
 	await bucket.put(`shares/${lapsing.id}.json`, JSON.stringify(manifest));
 	assert.equal(
-		(await request(`${lapsing.path}/page`, { headers: lapsing.cookie }))
-			.status,
+		(await request(`${lapsing.path}/page`, { headers: lapsing.cookie })).status,
 		404,
 	);
 
@@ -375,4 +390,61 @@ test("the viewer sends a page share's holder straight to the page", async () => 
 		[`/api/v1/shares/${id}/access`, "POST"],
 		[`/api/v1/shares/${id}/metadata`, "GET"],
 	]);
+});
+
+test("page: a page that is not UTF-8 is refused at completion and leaves nothing behind", async () => {
+	const latin1 = new Uint8Array([
+		...encoder.encode("<p>Jos"),
+		0xe9,
+		...encoder.encode("</p>"),
+	]);
+	const created = await prepare({
+		contentType: "text/html",
+		size: latin1.length,
+		expiresInDays: 1,
+	});
+	const share = await created.json();
+	const part = await request(`/api/v1/shares/${share.id}/parts/1`, {
+		method: "PUT",
+		headers,
+		body: latin1,
+	});
+	const done = await request(`/api/v1/shares/${share.id}/complete`, {
+		method: "POST",
+		headers,
+		body: JSON.stringify({ parts: [await part.json()] }),
+	});
+	assert.equal(done.status, 415);
+	const bucket = await runtime.getR2Bucket("MEDIA");
+	assert.equal(await bucket.head(`media/${share.id}`), null);
+	assert.equal(
+		(
+			await request(`/api/v1/shares/${share.id}/access`, {
+				method: "POST",
+				headers: { Authorization: `Bearer ${share.sharePath.split("#")[1]}` },
+			})
+		).status,
+		404,
+	);
+});
+
+test("page: a byte-order mark is kept, and at most 32 distinct inline scripts are allowed", async () => {
+	const scripts = Array.from(
+		{ length: 40 },
+		(_, i) => `<script>window.n${i}=${i}</script>`,
+	).join("");
+	const html = `\uFEFF<p>Jos\u00e9</p><script>window.n0=0</script>${scripts}`;
+	const share = await upload(html);
+	const response = await request(`${share.path}/page`, {
+		headers: share.cookie,
+	});
+	const bytes = new Uint8Array(await response.arrayBuffer());
+	assert.deepEqual(bytes, encoder.encode(html));
+	const allowed = directives(response.headers.get("Content-Security-Policy"))[
+		"script-src"
+	].split(" ");
+	assert.equal(allowed.length, 32);
+	assert.equal(new Set(allowed).size, 32);
+	assert.equal(allowed[0], sha256("window.n0=0"));
+	assert.equal(allowed[31], sha256("window.n31=31"));
 });

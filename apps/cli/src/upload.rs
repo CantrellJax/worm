@@ -107,6 +107,19 @@ fn shared_file_type(path: &Path) -> Option<&'static str> {
     }
 }
 
+const PAGE_LIMIT: u64 = 8 * 1024 * 1024;
+
+fn check_page(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|_| "Could not read the page.".to_string())?;
+    if bytes.len() as u64 > PAGE_LIMIT {
+        return Err("An HTML page can be at most 8 MiB. Nothing was uploaded.".to_string());
+    }
+    if std::str::from_utf8(&bytes).is_err() {
+        return Err("An HTML page must be saved as UTF-8. Nothing was uploaded.".to_string());
+    }
+    Ok(())
+}
+
 fn is_mp4(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
@@ -141,6 +154,9 @@ impl UploadArgs {
                 Some(content_type) if self.file.is_file() => (self.file.clone(), content_type),
                 _ => (self.resolve_upload_file().await?, "video/mp4"),
             };
+            if content_type == "text/html" {
+                check_page(&file_path)?;
+            }
             let title = self
                 .name
                 .as_deref()
@@ -593,9 +609,27 @@ async fn upload_file(http: &Client, put_url: &str, path: &Path) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
-    use super::{VideoMeta, agent_upload_payload, prefer_agent_upload_sources, shared_file_type};
+    use super::{
+        VideoMeta, agent_upload_payload, check_page, prefer_agent_upload_sources, shared_file_type,
+    };
     use crate::credentials::{AgentCredentialSource, CredentialSource};
     use std::path::Path;
+
+    #[test]
+    fn pages_must_be_utf8_and_at_most_8_mib() {
+        let dir = std::env::temp_dir().join(format!("page-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.html");
+        std::fs::write(&ok, "<p>Jos\u{e9}</p>").unwrap();
+        assert!(check_page(&ok).is_ok());
+        let latin1 = dir.join("latin1.html");
+        std::fs::write(&latin1, b"<p>Jos\xe9</p>").unwrap();
+        assert!(check_page(&latin1).unwrap_err().contains("UTF-8"));
+        let big = dir.join("big.html");
+        std::fs::write(&big, vec![b'a'; 8 * 1024 * 1024 + 1]).unwrap();
+        assert!(check_page(&big).unwrap_err().contains("8 MiB"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn sharing_uploads_pages_and_images_by_extension_and_leaves_the_rest_to_mp4_checks() {
