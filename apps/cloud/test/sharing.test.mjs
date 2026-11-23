@@ -95,7 +95,8 @@ test("owner authorization is required and arbitrary active content is rejected",
 		401,
 	);
 	for (const contentType of [
-		"text/html",
+		"text/html; charset=utf-8",
+		"application/xhtml+xml",
 		"image/svg+xml",
 		"application/json",
 	]) {

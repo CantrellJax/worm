@@ -32,11 +32,12 @@ Sharing is off by default. Settings → Sharing controls the server, upload cred
 cap sharing configure --server https://YOUR_WORKER.workers.dev --enable
 cap sharing configure --token-stdin < /path/to/protected-credential
 cap upload recording.mp4 --json
+cap upload questions.html --expires-in-days 1
 cap sharing status
 cap sharing revoke SHARE_ID
 ```
 
-Desktop and CLI read `~/.config/cap-ux/sharing.json`. Credentials are keyed by server origin in the system credential store. CAP_UX_UPLOAD_TOKEN supplies a headless credential; CAP_UX_SHARING_CONFIG selects an isolated configuration for testing. HTTPS is required except for localhost development. Redirects are refused so upload credentials cannot move to another endpoint. There is no Cap service fallback.
+`cap upload` also shares a PNG or JPEG image and a self-contained HTML page (`.html`, at most 8 MiB, UTF-8). `--expires-in-days` overrides the configured expiry for that one link. Desktop and CLI read `~/.config/cap-ux/sharing.json`. Credentials are keyed by server origin in the system credential store. CAP_UX_UPLOAD_TOKEN supplies a headless credential; CAP_UX_SHARING_CONFIG selects an isolated configuration for testing. HTTPS is required except for localhost development. Redirects are refused so upload credentials cannot move to another endpoint. There is no Cap service fallback.
 
 ## Protocol v1
 
@@ -45,16 +46,17 @@ All JSON is bounded. Writes require `Authorization: Bearer <owner-upload-credent
 | Method and path | Result |
 | --- | --- |
 | GET /healthz | Product and protocol version |
-| POST /api/v1/shares | Accept title, contentType, size and expiresInDays; return id, partSize, sharePath and expiresAt |
+| POST /api/v1/shares | Accept title, contentType, size and expiresInDays; return id, partSize, sharePath and expiresAt. A `text/html` page is at most 8 MiB |
 | PUT /api/v1/shares/ID/parts/N | Upload exactly the declared part size (final part can be smaller); return partNumber and etag |
 | POST /api/v1/shares/ID/complete | Accept ordered parts; validate final size before publishing |
 | DELETE /api/v1/shares/ID | Revoke access and remove the published media or abort an incomplete upload |
 | GET /api/v1/shares/ID/metadata | Read title, size, content type, expiry and whether captions and a card exist with a read capability |
 | PUT /api/v1/shares/ID/captions | Owner: store WebVTT captions (UTF-8, starting `WEBVTT`, at most 256 KiB) for a published video; replaces any earlier ones. DELETE removes them |
 | GET /api/v1/shares/ID/captions | Captions as `text/vtt` with the same bearer or cookie read access as the viewer. The `?token=` link and cross-origin playback that `/media` allows are not supported for captions. The viewer adds them as a `<track kind="captions">` when metadata says `captions: true` |
-| PUT /api/v1/shares/ID/card | Owner: store a preview card (JPEG or PNG by file signature, at most 2 MiB) for a published share; replaces any earlier one. DELETE removes it. Revoking removes it too |
+| PUT /api/v1/shares/ID/card | Owner: store a preview card (JPEG or PNG by file signature, at most 2 MiB) for a published video or image share; replaces any earlier one. HTML page shares cannot have one. DELETE removes it. Revoking removes it too |
 | GET or HEAD /s/ID/card | The card image, with no credential, while the share is live and has a card. Unknown, uncarded, expired and revoked shares all get the same 404 |
-| GET or HEAD /api/v1/shares/ID/media | Authorized media; single byte ranges supported. Also accepts `?token=READ_TOKEN` for a cross-origin `<video src>` |
+| GET or HEAD /api/v1/shares/ID/media | Authorized media; single byte ranges supported. Also accepts `?token=READ_TOKEN` for a cross-origin `<video src>`. An HTML page comes back as a sandboxed download, never rendered |
+| GET or HEAD /api/v1/shares/ID/page | An HTML page share, rendered, with the same bearer or cookie read access as the viewer (no `?token=`). The viewer opens it in place of itself |
 | POST /api/v1/shares/ID/access | Exchange the read capability for a scoped HttpOnly playback cookie bounded by link expiry |
 | GET /s/ID#READ_CAPABILITY | Viewer; the fragment is exchanged for playback access and never sent in the HTTP URL. Without a card its link preview is generic; with one it shows the share's title and card |
 | POST /api/v1/feedback | Multipart report (`key`, `note`, `evidence`, optional `screenshot` and `voice`) from a configured origin; returns its id |
@@ -70,7 +72,13 @@ Playback URL for another app's video player: share link `https://HOST/s/ID#TOKEN
 
 The create response's link is not readable until completion. The viewer capability is distinct from the upload credential and stored as a hash. Possessing a viewing link never authorizes uploads or revocation. Revocation has an independent tombstone so a concurrent completion cannot restore access. Expiry is enforced on every read; the bucket lifecycle later removes stored objects. Clients verify the final media's size before reporting success, revoke incomplete/failed attempts, and keep local files.
 
-Supported media: video/mp4, image/png and image/jpeg. Maximum media size: 20 GB. Multipart size: 8 MiB. Link expiry: 1–30 days. Raw traces, cookies, local configuration, API keys, notes and reports are not accepted as upload media. The current service has one administrative upload credential, not tenant accounts or a public upload form.
+Supported media: video/mp4, image/png, image/jpeg and text/html. Maximum media size: 20 GB; 8 MiB for an HTML page. Link expiry: 1–30 days. Multipart size: 8 MiB. Raw traces, cookies, local configuration, API keys, notes and reports are not accepted as upload media. The current service has one administrative upload credential, not tenant accounts or a public upload form.
+
+## HTML pages
+
+An HTML page share is for one self-contained page you wrote, such as a set of questions for someone outside your team. Pages can hold names or health information, so they use the same unlisted link as a recording: whoever opens `https://HOST/s/ID#KEY` trades the key for a cookie scoped to that share, and the viewer then replaces itself with the page at `/api/v1/shares/ID/page`. Expiry (one day is allowed) and revocation apply on every load. The link preview stays generic, a page share cannot carry a preview card, and the server never logs page content.
+
+The page is served with its own Content Security Policy instead of the site's: inline `<style>` and `style` attributes work; inline `<script>` blocks run because the server adds each one's SHA-256 to `script-src` (at most 32); scripts from any URL, event handler attributes and `eval` do not run; images, fonts and media load only from `data:` or `blob:`; `fetch` and form posts may go only to this server; the page cannot be framed, has no base URL override, is never cached and sends no referrer. Inline everything the page needs.
 
 ## Feedback from your web apps
 

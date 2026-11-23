@@ -230,6 +230,11 @@ impl SharingClient {
         })
     }
 
+    pub fn expiring_in_days(mut self, days: u32) -> Self {
+        self.days = days.clamp(1, 30);
+        self
+    }
+
     fn url(&self, path: &str) -> Url {
         self.base
             .join(path)
