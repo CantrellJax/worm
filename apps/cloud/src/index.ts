@@ -23,11 +23,14 @@ interface Share {
 	uploadId: string;
 	expiresAt: number;
 	ready: boolean;
+	pageCsp?: string;
 }
 
 const PART_SIZE = 8 * 1024 * 1024;
 const CAPTIONS_LIMIT = 256 * 1024;
 const CARD_LIMIT = 2 * 1024 * 1024;
+const PAGE_LIMIT = PART_SIZE;
+const PAGE_SCRIPT_LIMIT = 32;
 const CSP =
 	"default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; media-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 // The rrweb replay rebuilds the recorded page in a sandboxed iframe with the
@@ -39,9 +42,61 @@ const REWIND_CSP =
 const rewindPage = (pathname: string) =>
 	pathname.startsWith("/rewind/") &&
 	FEEDBACK_ID.test(pathname.slice("/rewind/".length));
+const PAGE_RESPONSE_PATH = /^\/api\/v1\/shares\/[a-f0-9-]{36}\/(?:page|media)$/;
 const VIEWER_PATH = /^\/s\/([a-f0-9-]{36})$/;
 const CARD_PATH = /^\/s\/([a-f0-9-]{36})\/card$/;
-const TYPES = new Set(["video/mp4", "image/png", "image/jpeg"]);
+const PAGE_TYPE = "text/html";
+const TYPES = new Set(["video/mp4", "image/png", "image/jpeg", PAGE_TYPE]);
+const MEDIA_PAGE_CSP = "sandbox; default-src 'none'";
+
+function pageCsp(scriptHashes: string[]): string {
+	const scripts = scriptHashes.length
+		? scriptHashes.map((value) => `'sha256-${value}'`).join(" ")
+		: "'none'";
+	return [
+		"default-src 'none'",
+		`script-src ${scripts}`,
+		"style-src 'unsafe-inline'",
+		"img-src data: blob:",
+		"font-src data:",
+		"media-src data: blob:",
+		"connect-src 'self'",
+		"form-action 'self'",
+		"frame-ancestors 'none'",
+		"base-uri 'none'",
+	].join("; ");
+}
+
+async function inlineScriptHashes(html: string): Promise<string[]> {
+	const scripts: string[] = [];
+	let current: string | undefined;
+	await new HTMLRewriter()
+		.on("script", {
+			element(element) {
+				current = element.hasAttribute("src") ? undefined : "";
+				element.onEndTag(() => {
+					if (current !== undefined) scripts.push(current);
+					current = undefined;
+				});
+			},
+			text(chunk) {
+				if (current !== undefined) current += chunk.text;
+			},
+		})
+		.transform(new Response(html))
+		.arrayBuffer();
+	const unique = new Set<string>();
+	for (const script of scripts) {
+		if (unique.size >= PAGE_SCRIPT_LIMIT) break;
+		// Browsers hash the script after the parser turns CRLF and CR into LF.
+		const text = script.replace(/\r\n?/g, "\n");
+		const digest = new Uint8Array(
+			await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)),
+		);
+		unique.add(btoa(String.fromCharCode(...digest)));
+	}
+	return [...unique];
+}
 
 async function owner(request: Request, env: RuntimeEnv): Promise<string> {
 	if (!env.UPLOAD_TOKEN || env.UPLOAD_TOKEN.length < 32) {
@@ -112,6 +167,7 @@ async function create(request: Request, env: RuntimeEnv): Promise<Response> {
 		size > 20 * 1024 ** 3 ||
 		typeof contentType !== "string" ||
 		!TYPES.has(contentType) ||
+		(contentType === PAGE_TYPE && size > PAGE_LIMIT) ||
 		typeof days !== "number" ||
 		!Number.isInteger(days) ||
 		days < 1 ||
@@ -119,7 +175,7 @@ async function create(request: Request, env: RuntimeEnv): Promise<Response> {
 	) {
 		throw new HttpError(
 			400,
-			"Choose a video or image, a valid size, and an expiry from 1 to 30 days.",
+			"Choose a video, image or HTML page (at most 8 MiB), a valid size, and an expiry from 1 to 30 days.",
 		);
 	}
 	const id = crypto.randomUUID();
@@ -191,7 +247,9 @@ async function media(
 	await readable(
 		request,
 		share,
-		new URL(request.url).searchParams.get("token") ?? "",
+		share.contentType === PAGE_TYPE
+			? ""
+			: (new URL(request.url).searchParams.get("token") ?? ""),
 	);
 	const range =
 		request.method === "HEAD"
@@ -211,6 +269,10 @@ async function media(
 		"Access-Control-Expose-Headers":
 			"Accept-Ranges, Content-Length, Content-Range, Content-Type",
 	});
+	if (share.contentType === PAGE_TYPE) {
+		headers.set("Content-Disposition", "attachment");
+		headers.set("Content-Security-Policy", MEDIA_PAGE_CSP);
+	}
 	if (range)
 		headers.set(
 			"Content-Range",
@@ -222,6 +284,51 @@ async function media(
 			: null,
 		{ status: range ? 206 : 200, headers },
 	);
+}
+
+async function servePage(
+	request: Request,
+	env: RuntimeEnv,
+	share: Share,
+): Promise<Response> {
+	await readable(request, share);
+	if (share.contentType !== PAGE_TYPE || !share.pageCsp)
+		throw new HttpError(404, "Share unavailable.");
+	const object =
+		request.method === "HEAD"
+			? await env.MEDIA.head(`media/${share.id}`)
+			: await env.MEDIA.get(`media/${share.id}`);
+	if (!object) throw new HttpError(404, "Share unavailable.");
+	return new Response(
+		"body" in object && object.body instanceof ReadableStream
+			? object.body
+			: null,
+		{
+			headers: {
+				"Content-Type": "text/html; charset=utf-8",
+				"Content-Length": `${object.size}`,
+				"Content-Security-Policy": share.pageCsp,
+				"X-Frame-Options": "DENY",
+				"Cross-Origin-Opener-Policy": "same-origin",
+			},
+		},
+	);
+}
+
+async function publishPage(env: RuntimeEnv, share: Share): Promise<void> {
+	const object = await env.MEDIA.get(`media/${share.id}`);
+	if (!object) throw new HttpError(404, "Share unavailable.");
+	let html: string;
+	try {
+		html = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+			await object.arrayBuffer(),
+		);
+	} catch {
+		await env.MEDIA.put(`revoked/${share.id}`, "revoked");
+		await env.MEDIA.delete(`media/${share.id}`);
+		throw new HttpError(415, "An HTML page must be UTF-8.");
+	}
+	share.pageCsp = pageCsp(await inlineScriptHashes(html));
 }
 
 async function putCaptions(
@@ -279,8 +386,11 @@ async function putCard(
 	env: RuntimeEnv,
 	share: Share,
 ): Promise<Response> {
-	if (!share.ready)
-		throw new HttpError(409, "A preview card needs a published share.");
+	if (!share.ready || share.contentType === PAGE_TYPE)
+		throw new HttpError(
+			409,
+			"A preview card needs a published video or image share.",
+		);
 	const bytes = await boundedBody(request, CARD_LIMIT);
 	const type = cardType(bytes);
 	if (!type)
@@ -302,9 +412,10 @@ async function liveCard(
 ): Promise<{ share: Share; type: string } | undefined> {
 	try {
 		const share = await load(env, id);
-		const type = share.ready
-			? (await env.MEDIA.head(`cards/${id}`))?.httpMetadata?.contentType
-			: undefined;
+		const type =
+			share.ready && share.contentType !== PAGE_TYPE
+				? (await env.MEDIA.head(`cards/${id}`))?.httpMetadata?.contentType
+				: undefined;
 		return type ? { share, type } : undefined;
 	} catch {
 		// A storage error must not fail the viewer page for people who hold the key.
@@ -395,7 +506,7 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 	if (url.pathname === "/api/v1/shares" && request.method === "POST")
 		return create(request, env);
 	const match =
-		/^\/api\/v1\/shares\/([a-f0-9-]{36})(?:\/(access|media|metadata|captions|card|complete|parts\/(\d+)))?$/.exec(
+		/^\/api\/v1\/shares\/([a-f0-9-]{36})(?:\/(access|media|page|metadata|captions|card|complete|parts\/(\d+)))?$/.exec(
 			url.pathname,
 		);
 	if (match) {
@@ -477,6 +588,7 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 			if (object.size !== share.size)
 				throw new HttpError(409, "Uploaded size does not match.");
 			await load(env, id);
+			if (share.contentType === PAGE_TYPE) await publishPage(env, share);
 			share.ready = true;
 			await env.MEDIA.put(`shares/${id}.json`, JSON.stringify(share));
 			return response({ id, ready: true });
@@ -484,15 +596,21 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 		if (request.method === "POST" && action === "access") {
 			const token = await readable(request, share);
 			const secure = url.protocol === "https:" ? "; Secure" : "";
+			const lifetime =
+				share.contentType === PAGE_TYPE
+					? ""
+					: `; Max-Age=${Math.floor((share.expiresAt - Date.now()) / 1000)}`;
 			return new Response(null, {
 				status: 204,
 				headers: {
-					"Set-Cookie": `capux_read=${token}; Path=/api/v1/shares/${id}/; HttpOnly${secure}; SameSite=Strict; Max-Age=${Math.floor((share.expiresAt - Date.now()) / 1000)}`,
+					"Set-Cookie": `capux_read=${token}; Path=/api/v1/shares/${id}/; HttpOnly${secure}; SameSite=Strict${lifetime}`,
 				},
 			});
 		}
 		if (["GET", "HEAD"].includes(request.method) && action === "media")
 			return media(request, env, share);
+		if (["GET", "HEAD"].includes(request.method) && action === "page")
+			return servePage(request, env, share);
 		if (request.method === "GET" && action === "metadata") {
 			await readable(request, share);
 			return response({
@@ -562,10 +680,17 @@ export default {
 		secured.headers.set("Cache-Control", "private, no-store");
 		secured.headers.set("Referrer-Policy", "no-referrer");
 		secured.headers.set("X-Content-Type-Options", "nosniff");
-		secured.headers.set(
-			"Content-Security-Policy",
-			rewindPage(new URL(request.url).pathname) ? REWIND_CSP : CSP,
-		);
+		const pathname = new URL(request.url).pathname;
+		if (
+			!(
+				PAGE_RESPONSE_PATH.test(pathname) &&
+				result.headers.has("Content-Security-Policy")
+			)
+		)
+			secured.headers.set(
+				"Content-Security-Policy",
+				rewindPage(pathname) ? REWIND_CSP : CSP,
+			);
 		return secured;
 	},
 } satisfies ExportedHandler<RuntimeEnv>;

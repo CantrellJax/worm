@@ -11,7 +11,7 @@ use crate::{OutputFormat, caps::AgentClient, credentials, export, resolve_format
 
 #[derive(Args)]
 pub struct UploadArgs {
-    /// Path to a video file (.mp4) or a '.cap' project directory to upload
+    /// Path to a video file (.mp4), an image (.png, .jpg), a self-contained HTML page (.html) or a '.cap' project directory to upload
     file: PathBuf,
     /// Title for the uploaded video
     #[arg(long)]
@@ -22,6 +22,9 @@ pub struct UploadArgs {
     /// If the input is a '.cap' project with no exported video yet, export it first
     #[arg(long)]
     export: bool,
+    /// Days until the link expires (1-30); defaults to the sharing setting
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=30))]
+    expires_in_days: Option<u32>,
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     format: OutputFormat,
 }
@@ -94,6 +97,29 @@ fn rational_fps(rate: ffmpeg::Rational) -> Option<f64> {
         .then(|| f64::from(rate.numerator()) / f64::from(rate.denominator()))
 }
 
+fn shared_file_type(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    match ext.as_str() {
+        "html" | "htm" => Some("text/html"),
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        _ => None,
+    }
+}
+
+const PAGE_LIMIT: u64 = 8 * 1024 * 1024;
+
+fn check_page(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|_| "Could not read the page.".to_string())?;
+    if bytes.len() as u64 > PAGE_LIMIT {
+        return Err("An HTML page can be at most 8 MiB. Nothing was uploaded.".to_string());
+    }
+    if std::str::from_utf8(&bytes).is_err() {
+        return Err("An HTML page must be saved as UTF-8. Nothing was uploaded.".to_string());
+    }
+    Ok(())
+}
+
 fn is_mp4(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("mp4"))
@@ -120,8 +146,17 @@ impl UploadArgs {
                     "Cap creates a new expiring link for each share. Use cap sharing revoke to revoke a previous link.",
                 ));
             }
-            let client = cap_cloud_sharing::SharingClient::configured()?;
-            let file_path = self.resolve_upload_file().await?;
+            let mut client = cap_cloud_sharing::SharingClient::configured()?;
+            if let Some(days) = self.expires_in_days {
+                client = client.expiring_in_days(days);
+            }
+            let (file_path, content_type) = match shared_file_type(&self.file) {
+                Some(content_type) if self.file.is_file() => (self.file.clone(), content_type),
+                _ => (self.resolve_upload_file().await?, "video/mp4"),
+            };
+            if content_type == "text/html" {
+                check_page(&file_path)?;
+            }
             let title = self
                 .name
                 .as_deref()
@@ -131,7 +166,7 @@ impl UploadArgs {
                 .upload_file(
                     &file_path,
                     title,
-                    "video/mp4",
+                    content_type,
                     |_| {},
                     &std::sync::atomic::AtomicBool::new(false),
                 )
@@ -143,6 +178,9 @@ impl UploadArgs {
                     Ok(())
                 }
             };
+        }
+        if self.expires_in_days.is_some() {
+            return Err("--expires-in-days needs a sharing server.".to_string());
         }
         let file_path = self.resolve_upload_file().await?;
         let meta = probe_video_meta(&file_path)?;
@@ -571,8 +609,41 @@ async fn upload_file(http: &Client, put_url: &str, path: &Path) -> Result<(), St
 
 #[cfg(test)]
 mod tests {
-    use super::{VideoMeta, agent_upload_payload, prefer_agent_upload_sources};
+    use super::{
+        VideoMeta, agent_upload_payload, check_page, prefer_agent_upload_sources, shared_file_type,
+    };
     use crate::credentials::{AgentCredentialSource, CredentialSource};
+    use std::path::Path;
+
+    #[test]
+    fn pages_must_be_utf8_and_at_most_8_mib() {
+        let dir = std::env::temp_dir().join(format!("page-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.html");
+        std::fs::write(&ok, "<p>Jos\u{e9}</p>").unwrap();
+        assert!(check_page(&ok).is_ok());
+        let latin1 = dir.join("latin1.html");
+        std::fs::write(&latin1, b"<p>Jos\xe9</p>").unwrap();
+        assert!(check_page(&latin1).unwrap_err().contains("UTF-8"));
+        let big = dir.join("big.html");
+        std::fs::write(&big, vec![b'a'; 8 * 1024 * 1024 + 1]).unwrap();
+        assert!(check_page(&big).unwrap_err().contains("8 MiB"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sharing_uploads_pages_and_images_by_extension_and_leaves_the_rest_to_mp4_checks() {
+        assert_eq!(
+            shared_file_type(Path::new("a/page.html")),
+            Some("text/html")
+        );
+        assert_eq!(shared_file_type(Path::new("page.HTM")), Some("text/html"));
+        assert_eq!(shared_file_type(Path::new("shot.png")), Some("image/png"));
+        assert_eq!(shared_file_type(Path::new("shot.JPEG")), Some("image/jpeg"));
+        for path in ["clip.mp4", "page.svg", "page.xhtml", "notes", "walk.cap"] {
+            assert_eq!(shared_file_type(Path::new(path)), None, "{path}");
+        }
+    }
 
     #[test]
     fn agent_upload_payload_only_includes_a_requested_title() {
