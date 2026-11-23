@@ -157,9 +157,12 @@ test("page: the link's cookie opens the page as itself, with a page-specific CSP
 		"frame-ancestors",
 		"img-src",
 		"media-src",
+		"sandbox",
 		"script-src",
 		"style-src",
 	]);
+	assert.equal(policy.sandbox, "allow-scripts allow-forms");
+	assert.equal(response.headers.get("Cross-Origin-Opener-Policy"), null);
 	assert.equal(policy["default-src"], "'none'");
 	assert.equal(policy["connect-src"], "'self'");
 	assert.equal(policy["form-action"], "'self'");
