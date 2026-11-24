@@ -1,24 +1,31 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { binding, render } from "./questions-page.mjs";
+import { relay, specFromAsks, zmCli } from "./relay.mjs";
 
 const USAGE = `Usage: questions.mjs <command> [options]
   share <spec.json> [--days 1-30] [--title text]   build the page and share it; prints the link
+  ask-page <ask id>... [--title text] [--intro text] [--html-file f] [--days 1-30] [--out spec.json]
+      build the page from open zm asks held for a contact and share it (--out: write the spec only)
+  relay [--share ID] [--dry-run]   record each pending answer in zm as the contact's, then mark it recorded
   pending [--share ID] [--state pending|recorded|all]   answers waiting to be recorded (JSON)
   recorded <share id> <ask id> <revision>   mark one answer recorded
   revoke <share id>   end the link (answers already given stay readable to the owner)
 Options: --host https://server (default: the sharing config). The owner credential
 comes from CAP_UX_UPLOAD_TOKEN or the macOS keychain entry the app saves.`;
 
+const FLAGS = new Set(["--dry-run"]);
+
 export function options(args) {
 	const positional = [];
 	const named = {};
 	for (let i = 0; i < args.length; i += 1) {
-		if (args[i].startsWith("--")) {
+		if (FLAGS.has(args[i])) named[args[i].slice(2)] = true;
+		else if (args[i].startsWith("--")) {
 			const value = args[i + 1];
 			if (value === undefined || value.startsWith("--"))
 				throw new Error(`${args[i]} needs a value.`);
@@ -153,9 +160,38 @@ async function main() {
 		console.log(USAGE);
 		return;
 	}
+	if (command === "ask-page" && named.out) {
+		const spec = specFromAsks(zmCli(), positional, {
+			...named,
+			html: named["html-file"] && readFileSync(named["html-file"], "utf8"),
+		});
+		writeFileSync(named.out, `${JSON.stringify(spec, null, 2)}\n`);
+		console.log(
+			`wrote ${named.out}; share it with: questions.mjs share ${named.out}`,
+		);
+		return;
+	}
 	const origin = host(named);
 	const api = client(origin);
-	if (command === "share" && positional.length === 1) {
+	if (command === "ask-page" && positional.length > 0) {
+		const spec = specFromAsks(zmCli(), positional, {
+			...named,
+			html: named["html-file"] && readFileSync(named["html-file"], "utf8"),
+		});
+		const shared = await sharePage(api, origin, spec, named);
+		console.log(
+			`id: ${shared.id}\nexpires: ${shared.expiresAt}\nlink: ${shared.link}`,
+		);
+	} else if (command === "relay" && positional.length === 0) {
+		const summary = await relay(api, zmCli(), {
+			share: named.share,
+			dryRun: !!named["dry-run"],
+		});
+		console.log(
+			`recorded ${summary.recorded}, skipped ${summary.skipped}, failed ${summary.failed}${summary.more ? "; more are waiting, run it again" : ""}`,
+		);
+		if (summary.failed) process.exitCode = 1;
+	} else if (command === "share" && positional.length === 1) {
 		const spec = JSON.parse(readFileSync(positional[0], "utf8"));
 		const shared = await sharePage(api, origin, spec, named);
 		console.log(

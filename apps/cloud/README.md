@@ -97,6 +97,15 @@ node scripts/questions.mjs recorded SHARE_ID ASK_ID REVISION      # after you re
 node scripts/questions.mjs revoke SHARE_ID
 ```
 
+From zm asks held for an outside contact (`zm ask new --for ... --topic ... --choice ... --recommend ...`), one command reads each ask's card (question, choices, recommendation) and shares the page; `--out spec.json` writes the spec instead so you can edit it first:
+
+```sh
+node scripts/questions.mjs ask-page ASK_ID [ASK_ID...] --title "A few questions" --intro "..." --days 1
+node scripts/questions.mjs relay            # or --dry-run first; --share ID for one link
+```
+
+`relay` takes each pending answer, runs `zm ask answer ASK_ID KEY --text ... --as contact` so it shows in Decisions as what the contact said, then marks it recorded. "I can't answer this" goes to zm as `needs_context` with the contact's note, or a stock note if they wrote none, which sends the ask back to its asker. It is safe to run again: recorded answers are not listed, and when zm already holds the same contact answer (a run that stopped before marking) it only marks it. An answer whose ask is no longer open is skipped and stays pending. It runs `zm` from your PATH (or `ZM_BIN`) with your own zm identity, so run it as a project owner.
+
 The spec: `title`, optional `intro` (plain text) and `html`, and 1–20 `questions`, each with `askId` (a zm ask id), `question`, 2–4 `choices` (`key` a–d, `label`), optional `recommended` key (shown as Suggested), `allowText` (default true) and optional `html`. The `html` fragments, such as a table, go into the page as written, so pass only markup you wrote; comments and script, frame, object, embed, base, meta, link, form, plaintext, xmp, textarea, noscript, title, style, select and template tags are refused (use `style` attributes). All other text is escaped. The page has one inline script that is the same for every page. The scripts read the server from `~/.config/cap-ux/sharing.json` (or `--host`) and the owner credential from `CAP_UX_UPLOAD_TOKEN` or the keychain entry the app saves.
 
 How it is protected:
