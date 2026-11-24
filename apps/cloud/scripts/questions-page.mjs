@@ -3,7 +3,9 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const KEYS = ["a", "b", "c", "d"];
-const ASK_ID = /^[0-9A-Za-z_-]{1,64}$/;
+export const NEEDS_CONTEXT_NOTE =
+	"The contact could not answer this on the page.";
+const ASK_ID = /^[0-9A-Za-z_][0-9A-Za-z_-]{0,63}$/;
 const BLOCKED =
 	/<!--|<\s*\/?\s*(script|iframe|frame|object|embed|base|meta|link|form|plaintext|xmp|textarea|noscript|noembed|noframes|title|style|select|template)\b/i;
 

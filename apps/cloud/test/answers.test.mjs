@@ -641,3 +641,64 @@ test("page kit: one self-contained page with every question, escaped text and on
 		{ askId: ASK_TWO, choices: ["a", "b"], allowText: false },
 	]);
 });
+
+test("answers: the owner list pages with after=next and visits every answer once", async () => {
+	const many = {
+		title: "Synthetic many",
+		questions: Array.from({ length: 20 }, (_, i) => ({
+			askId: `01PAGE${String(i).padStart(2, "0")}`,
+			question: `Made-up question ${i}?`,
+			choices: [
+				{ key: "a", label: "Yes" },
+				{ key: "b", label: "No" },
+			],
+		})),
+	};
+	const ids = [];
+	for (let s = 0; s < 3; s += 1) {
+		const page = await share(binding(many));
+		ids.push(page.id);
+		for (const q of many.questions)
+			assert.equal((await page.send({ askId: q.askId, key: "a" })).status, 200);
+	}
+	const seen = new Set();
+	let after = null;
+	let calls = 0;
+	for (;;) {
+		const query = new URLSearchParams({ state: "pending" });
+		if (after) query.set("after", after);
+		const response = await request(`/api/v1/answers?${query}`, {
+			headers: ownerHeaders,
+		});
+		assert.equal(response.status, 200);
+		const body = await response.json();
+		calls += 1;
+		assert.ok(body.answers.length <= 40);
+		for (const a of body.answers) {
+			const key = `${a.shareId}/${a.askId}`;
+			assert.ok(!seen.has(key), key);
+			seen.add(key);
+		}
+		if (!body.more) break;
+		after = body.next;
+	}
+	assert.ok(calls >= 2);
+	for (const id of ids)
+		for (const q of many.questions) assert.ok(seen.has(`${id}/${q.askId}`));
+	assert.equal(
+		(await request("/api/v1/answers?after=../x", { headers: ownerHeaders }))
+			.status,
+		400,
+	);
+});
+
+test("answers: zero-width and other ignorable characters are removed as zm removes them", async () => {
+	const page = await share();
+	const saved = await page.send({
+		askId: ASK_ONE,
+		key: "a",
+		text: "Yes​ ple­ase﻿ next",
+	});
+	assert.equal((await saved.json()).text, "Yes please\nnext");
+	assert.equal((await page.send({ askId: ASK_ONE, text: "​​" })).status, 400);
+});

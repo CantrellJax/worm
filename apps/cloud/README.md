@@ -59,7 +59,7 @@ All JSON is bounded. Writes require `Authorization: Bearer <owner-upload-credent
 | GET or HEAD /api/v1/shares/ID/page | An HTML page share, rendered, with the same bearer or cookie read access as the viewer (no `?token=`). The viewer opens it in place of itself |
 | POST /api/v1/shares/ID/access | Exchange the read capability for a scoped HttpOnly playback cookie bounded by link expiry |
 | POST or GET /api/v1/shares/ID/answers | The recipient's page saves one answer, or reads back its saved answers, with the answer token (see [Questions pages](#questions-pages)) |
-| GET /api/v1/answers | Owner: answers across shares, `?share=ID` for one share, `?state=pending` (default), `recorded` or `all`; at most 40 per call, with `more: true` when there are others (record those and call again) |
+| GET /api/v1/answers | Owner: answers across shares, `?share=ID` for one share, `?state=pending` (default), `recorded` or `all`; at most 40 per call; with `more: true`, pass the returned `next` as `after=` for the following page |
 | POST /api/v1/answers/ID/ASK_ID/recorded | Owner: mark the answer recorded, naming the `revision` you recorded (409 if it changed since); the recipient can no longer change it |
 | GET /s/ID#READ_CAPABILITY | Viewer; the fragment is exchanged for playback access and never sent in the HTTP URL. Without a card its link preview is generic; with one it shows the share's title and card |
 | POST /api/v1/feedback | Multipart report (`key`, `note`, `evidence`, optional `screenshot` and `voice`) from a configured origin; returns its id |
@@ -97,6 +97,15 @@ node scripts/questions.mjs recorded SHARE_ID ASK_ID REVISION      # after you re
 node scripts/questions.mjs revoke SHARE_ID
 ```
 
+From zm asks held for an outside contact (`zm ask new --for ... --topic ... --choice ... --recommend ...`), one command reads each ask's card (question, choices, recommendation) and shares the page; `--out spec.json` writes the spec instead so you can edit it first:
+
+```sh
+node scripts/questions.mjs ask-page ASK_ID [ASK_ID...] --title "A few questions" --intro "..." --days 1
+node scripts/questions.mjs relay            # or --dry-run first; --share ID for one link
+```
+
+`relay` takes each pending answer, runs `zm ask answer ASK_ID KEY --text ... --as contact` so it shows in Decisions as what the contact said, then marks it recorded. "I can't answer this" goes to zm as `needs_context` with the contact's note, or a stock note if they wrote none, which sends the ask back to its asker. It is safe to run again: recorded answers are not listed, and when zm already holds the same contact answer (a run that stopped before marking) it only marks it. An answer whose ask is no longer open is skipped and stays pending. It checks every field the server returns before using it, passes them to zm after `--` so none can become an option, reads at most 50 pages per run, and gives each zm call two minutes. It runs `zm` from your PATH (or `ZM_BIN`) with your own zm identity, so run it as a project owner.
+
 The spec: `title`, optional `intro` (plain text) and `html`, and 1–20 `questions`, each with `askId` (a zm ask id), `question`, 2–4 `choices` (`key` a–d, `label`), optional `recommended` key (shown as Suggested), `allowText` (default true) and optional `html`. The `html` fragments, such as a table, go into the page as written, so pass only markup you wrote; comments and script, frame, object, embed, base, meta, link, form, plaintext, xmp, textarea, noscript, title, style, select and template tags are refused (use `style` attributes). All other text is escaped. The page has one inline script that is the same for every page. The scripts read the server from `~/.config/cap-ux/sharing.json` (or `--host`) and the owner credential from `CAP_UX_UPLOAD_TOKEN` or the keychain entry the app saves.
 
 How it is protected:
@@ -104,7 +113,7 @@ How it is protected:
 - `questions` on create is a list of `{askId, choices, allowText}`. Only those ask ids and choice keys (plus `needs_context`) are accepted, and written answers only where `allowText` is true or with `needs_context`.
 - The answer token is SHA-256 of `share-answer/1:` plus the link's key, as lowercase hex. The server keeps only its hash. The viewer works it out after the key exchange and opens the page as `/page#answer=TOKEN`, so the page never sees the link's key, and a recipient who reloads keeps answering. That page URL, with the answer token, stays in the browser's history until the link expires; it can only answer, not read the page. Requests send it as `Authorization: Bearer`. A wrong token is 401.
 - The sandboxed page's requests have the origin `null`. The answer route accepts only `null` or this server's own origin, answers CORS preflight only for those, never sends credentials, and refuses all others with 403. Other sandboxed pages also send `null`, so the token is the real check. Each share and IP address can save about 30 answers a minute (`ANSWER_LIMIT`).
-- A later save replaces the earlier one (its `revision` goes up) until the owner marks it recorded; then the page shows it as received and saves are refused with 409.
+- Written answers drop invisible characters (zero-width spaces, soft hyphens and other default-ignorable characters) the same way zm does, and refuse direction overrides and control characters. A later save replaces the earlier one (its `revision` goes up) until the owner marks it recorded; then the page shows it as received and saves are refused with 409.
 - Revoking or expiry ends answering (404). Answers already given stay readable to the owner until the bucket's 31-day rule removes them, so the owner can record them after revoking. They are stored under `answers/` in the private bucket and never logged.
 
 ## Feedback from your web apps
