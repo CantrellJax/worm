@@ -1,4 +1,11 @@
 import brand from "../../../crates/fork-brand/brand.json";
+import {
+	answerToken,
+	ownerAnswers,
+	parseQuestions,
+	type Question,
+	recipientAnswers,
+} from "./answers";
 import { ID as FEEDBACK_ID, feedback } from "./feedback";
 import { recovery } from "./recovery";
 import {
@@ -24,6 +31,8 @@ interface Share {
 	expiresAt: number;
 	ready: boolean;
 	pageCsp?: string;
+	questions?: Question[];
+	answerHash?: string;
 }
 
 const PART_SIZE = 8 * 1024 * 1024;
@@ -48,6 +57,9 @@ const CARD_PATH = /^\/s\/([a-f0-9-]{36})\/card$/;
 const PAGE_TYPE = "text/html";
 const TYPES = new Set(["video/mp4", "image/png", "image/jpeg", PAGE_TYPE]);
 const MEDIA_PAGE_CSP = "sandbox; default-src 'none'";
+// Pages share this origin, so each one runs in an opaque origin: it cannot
+// reach this server's cookies or storage, nor other shares the browser holds.
+const PAGE_SANDBOX = "sandbox allow-scripts allow-forms";
 
 function pageCsp(scriptHashes: string[]): string {
 	const scripts = scriptHashes.length
@@ -178,6 +190,10 @@ async function create(request: Request, env: RuntimeEnv): Promise<Response> {
 			"Choose a video, image or HTML page (at most 8 MiB), a valid size, and an expiry from 1 to 30 days.",
 		);
 	}
+	if (body.questions !== undefined && contentType !== PAGE_TYPE)
+		throw new HttpError(400, "Only an HTML page share can carry questions.");
+	const questions =
+		body.questions === undefined ? undefined : parseQuestions(body.questions);
 	const id = crypto.randomUUID();
 	const token = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
 		byte.toString(16).padStart(2, "0"),
@@ -195,6 +211,9 @@ async function create(request: Request, env: RuntimeEnv): Promise<Response> {
 		uploadId: upload.uploadId,
 		expiresAt: Date.now() + days * 86400000,
 		ready: false,
+		...(questions
+			? { questions, answerHash: await hash(await answerToken(token)) }
+			: {}),
 	};
 	await env.MEDIA.put(`shares/${id}.json`, JSON.stringify(share));
 	return response(
@@ -307,9 +326,8 @@ async function servePage(
 			headers: {
 				"Content-Type": "text/html; charset=utf-8",
 				"Content-Length": `${object.size}`,
-				"Content-Security-Policy": share.pageCsp,
+				"Content-Security-Policy": `${share.pageCsp}; ${PAGE_SANDBOX}`,
 				"X-Frame-Options": "DENY",
-				"Cross-Origin-Opener-Policy": "same-origin",
 			},
 		},
 	);
@@ -501,16 +519,25 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 		url.pathname.startsWith("/api/v1/feedback/")
 	)
 		return feedback(request, env, () => owner(request, env));
+	if (
+		url.pathname === "/api/v1/answers" ||
+		url.pathname.startsWith("/api/v1/answers/")
+	) {
+		await owner(request, env);
+		return ownerAnswers(request, env, url);
+	}
 	if (url.pathname === "/healthz")
 		return response({ product: "capux", protocol: 1 });
 	if (url.pathname === "/api/v1/shares" && request.method === "POST")
 		return create(request, env);
 	const match =
-		/^\/api\/v1\/shares\/([a-f0-9-]{36})(?:\/(access|media|page|metadata|captions|card|complete|parts\/(\d+)))?$/.exec(
+		/^\/api\/v1\/shares\/([a-f0-9-]{36})(?:\/(access|answers|media|page|metadata|captions|card|complete|parts\/(\d+)))?$/.exec(
 			url.pathname,
 		);
 	if (match) {
 		const [, id, action, part] = match;
+		if (action === "answers")
+			return recipientAnswers(request, env, id, () => load(env, id));
 		const writing =
 			request.method === "DELETE" ||
 			(request.method === "PUT" &&
@@ -621,6 +648,7 @@ async function route(request: Request, env: RuntimeEnv): Promise<Response> {
 				expiresAt: share.expiresAt,
 				captions: !!(await env.MEDIA.head(`captions/${id}`)),
 				card: !!(await env.MEDIA.head(`cards/${id}`)),
+				questions: !!share.questions?.length,
 			});
 		}
 		throw new HttpError(405, "Method not allowed.");

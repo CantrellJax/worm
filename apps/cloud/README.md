@@ -46,7 +46,7 @@ All JSON is bounded. Writes require `Authorization: Bearer <owner-upload-credent
 | Method and path | Result |
 | --- | --- |
 | GET /healthz | Product and protocol version |
-| POST /api/v1/shares | Accept title, contentType, size and expiresInDays; return id, partSize, sharePath and expiresAt. A `text/html` page is at most 8 MiB |
+| POST /api/v1/shares | Accept title, contentType, size and expiresInDays; return id, partSize, sharePath and expiresAt. A `text/html` page is at most 8 MiB and may carry `questions` (see [Questions pages](#questions-pages)) |
 | PUT /api/v1/shares/ID/parts/N | Upload exactly the declared part size (final part can be smaller); return partNumber and etag |
 | POST /api/v1/shares/ID/complete | Accept ordered parts; validate final size before publishing |
 | DELETE /api/v1/shares/ID | Revoke access and remove the published media or abort an incomplete upload |
@@ -58,6 +58,9 @@ All JSON is bounded. Writes require `Authorization: Bearer <owner-upload-credent
 | GET or HEAD /api/v1/shares/ID/media | Authorized media; single byte ranges supported. Also accepts `?token=READ_TOKEN` for a cross-origin `<video src>`. An HTML page comes back as a sandboxed download, never rendered, and only with bearer or cookie access |
 | GET or HEAD /api/v1/shares/ID/page | An HTML page share, rendered, with the same bearer or cookie read access as the viewer (no `?token=`). The viewer opens it in place of itself |
 | POST /api/v1/shares/ID/access | Exchange the read capability for a scoped HttpOnly playback cookie bounded by link expiry |
+| POST or GET /api/v1/shares/ID/answers | The recipient's page saves one answer, or reads back its saved answers, with the answer token (see [Questions pages](#questions-pages)) |
+| GET /api/v1/answers | Owner: answers across shares, `?share=ID` for one share, `?state=pending` (default), `recorded` or `all`; at most 40 per call, with `more: true` when there are others (record those and call again) |
+| POST /api/v1/answers/ID/ASK_ID/recorded | Owner: mark the answer recorded, naming the `revision` you recorded (409 if it changed since); the recipient can no longer change it |
 | GET /s/ID#READ_CAPABILITY | Viewer; the fragment is exchanged for playback access and never sent in the HTTP URL. Without a card its link preview is generic; with one it shows the share's title and card |
 | POST /api/v1/feedback | Multipart report (`key`, `note`, `evidence`, optional `screenshot` and `voice`) from a configured origin; returns its id |
 | GET /api/v1/feedback | Owner: list reports, newest first (`cursor` pages) |
@@ -78,7 +81,31 @@ Supported media: video/mp4, image/png, image/jpeg and text/html. Maximum media s
 
 An HTML page share is for one self-contained page you wrote, such as a set of questions for someone outside your team. Pages can hold names or health information, so they use the same unlisted link as a recording: whoever opens `https://HOST/s/ID#KEY` trades the key for a cookie scoped to that share that ends with the browser session, and the viewer then replaces itself with the page at `/api/v1/shares/ID/page`. Expiry (one day is allowed) and revocation apply on every load. The page must be UTF-8; completing an upload that is not ends the share with 415. The link preview stays generic, a page share cannot carry a preview card, and the server never logs page content.
 
-The page is served with its own Content Security Policy instead of the site's: inline `<style>` and `style` attributes work; inline `<script>` blocks run because the server adds each one's SHA-256 to `script-src` (at most 32); scripts from any URL, event handler attributes and `eval` do not run; images, fonts and media load only from `data:` or `blob:`; `fetch` and form posts may go only to this server; the page cannot be framed, has no base URL override, is never cached and sends no referrer. Inline everything the page needs.
+The page is served with its own Content Security Policy instead of the site's, including `sandbox allow-scripts allow-forms`: the page runs in an opaque origin, so its scripts cannot read or set this server's cookies, use local storage, or reach other shares open in the same browser. Beyond that: inline `<style>` and `style` attributes work; inline `<script>` blocks run because the server adds each one's SHA-256 to `script-src` (at most 32); scripts from any URL, event handler attributes and `eval` do not run; images, fonts and media load only from `data:` or `blob:`; `fetch` and form posts may go only to this server; the page cannot be framed, has no base URL override, is never cached and sends no referrer. Inline everything the page needs.
+
+## Questions pages
+
+A page share can carry questions for its one recipient, each bound to a zm ask, and take their answers on the page: a choice, an optional written answer (at most 2,000 bytes), or "I can't answer this" (`needs_context`).
+
+Build and share one from a JSON spec, with no external assets:
+
+```sh
+node scripts/questions-page.mjs questions.json -o questions.html   # preview the page only
+node scripts/questions.mjs share questions.json --days 1          # build, upload with the bindings, print the link
+node scripts/questions.mjs pending                                # answers waiting (JSON), add --share ID for one link
+node scripts/questions.mjs recorded SHARE_ID ASK_ID REVISION      # after you record one in zm
+node scripts/questions.mjs revoke SHARE_ID
+```
+
+The spec: `title`, optional `intro` (plain text) and `html`, and 1–20 `questions`, each with `askId` (a zm ask id), `question`, 2–4 `choices` (`key` a–d, `label`), optional `recommended` key (shown as Suggested), `allowText` (default true) and optional `html`. The `html` fragments, such as a table, go into the page as written, so pass only markup you wrote; comments and script, frame, object, embed, base, meta, link, form, plaintext, xmp, textarea, noscript, title, style, select and template tags are refused (use `style` attributes). All other text is escaped. The page has one inline script that is the same for every page. The scripts read the server from `~/.config/cap-ux/sharing.json` (or `--host`) and the owner credential from `CAP_UX_UPLOAD_TOKEN` or the keychain entry the app saves.
+
+How it is protected:
+
+- `questions` on create is a list of `{askId, choices, allowText}`. Only those ask ids and choice keys (plus `needs_context`) are accepted, and written answers only where `allowText` is true or with `needs_context`.
+- The answer token is SHA-256 of `share-answer/1:` plus the link's key, as lowercase hex. The server keeps only its hash. The viewer works it out after the key exchange and opens the page as `/page#answer=TOKEN`, so the page never sees the link's key, and a recipient who reloads keeps answering. That page URL, with the answer token, stays in the browser's history until the link expires; it can only answer, not read the page. Requests send it as `Authorization: Bearer`. A wrong token is 401.
+- The sandboxed page's requests have the origin `null`. The answer route accepts only `null` or this server's own origin, answers CORS preflight only for those, never sends credentials, and refuses all others with 403. Other sandboxed pages also send `null`, so the token is the real check. Each share and IP address can save about 30 answers a minute (`ANSWER_LIMIT`).
+- A later save replaces the earlier one (its `revision` goes up) until the owner marks it recorded; then the page shows it as received and saves are refused with 409.
+- Revoking or expiry ends answering (404). Answers already given stay readable to the owner until the bucket's 31-day rule removes them, so the owner can record them after revoking. They are stored under `answers/` in the private bucket and never logged.
 
 ## Feedback from your web apps
 

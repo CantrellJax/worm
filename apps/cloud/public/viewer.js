@@ -18,6 +18,18 @@ function trimStray(value) {
 	}
 }
 
+// The page runs sandboxed and never sees the read key, only this derived
+// answer credential; the server holds its SHA-256 (answerToken in src/answers.ts).
+async function answerToken(readToken) {
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(`share-answer/1:${readToken}`),
+	);
+	return Array.from(new Uint8Array(digest), (byte) =>
+		byte.toString(16).padStart(2, "0"),
+	).join("");
+}
+
 async function openShare() {
 	const id = trimStray(location.pathname).split("/").at(-1);
 	const base = `/api/v1/shares/${id}`;
@@ -40,7 +52,9 @@ async function openShare() {
 		);
 	const share = await response.json();
 	if (share.contentType === "text/html") {
-		location.replace(`${base}/page`);
+		const answer =
+			token && share.questions ? `#answer=${await answerToken(token)}` : "";
+		location.replace(`${base}/page${answer}`);
 		return;
 	}
 	document.title = document.title.replace("Shared recording", share.title);
