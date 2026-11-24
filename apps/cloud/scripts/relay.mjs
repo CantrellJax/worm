@@ -1,29 +1,55 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { NEEDS_CONTEXT_NOTE } from "./questions-page.mjs";
+
+const ASK_ID = /^[0-9A-Za-z_][0-9A-Za-z_-]{0,63}$/;
+const SHARE_ID = /^[a-f0-9-]{36}$/;
+const KEYS = new Set(["a", "b", "c", "d", "needs_context"]);
+const PAGE_LIMIT = 50;
 
 export function zmCli(bin = process.env.ZM_BIN ?? "zm") {
 	return (args) => {
-		try {
-			return {
-				ok: true,
-				output: execFileSync(bin, args, {
-					encoding: "utf8",
-					stdio: ["ignore", "pipe", "pipe"],
-				}),
-			};
-		} catch (error) {
-			return {
-				ok: false,
-				output: `${error.stdout ?? ""}${error.stderr ?? ""}`.trim(),
-			};
-		}
+		const run = spawnSync(bin, args, {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "pipe"],
+			timeout: 120_000,
+		});
+		return {
+			ok: run.status === 0,
+			output:
+				run.status === 0
+					? run.stdout
+					: `${run.stdout ?? ""}${run.stderr ?? ""}`.trim() ||
+						String(run.error ?? `exit ${run.status}`),
+			warning: run.status === 0 ? (run.stderr ?? "").trim() : "",
+		};
 	};
 }
 
 export function showAsk(zm, askId) {
-	const result = zm(["ask", "show", askId, "--json"]);
+	if (!ASK_ID.test(askId)) throw new Error("not a zm ask id");
+	const result = zm(["ask", "show", "--json", "--", askId]);
 	if (!result.ok) throw new Error(`zm ask show ${askId}: ${result.output}`);
-	return JSON.parse(result.output);
+	const ask = JSON.parse(result.output);
+	if (typeof ask !== "object" || ask === null || ask.id !== askId)
+		throw new Error(`zm ask show ${askId} returned no such ask`);
+	return ask;
+}
+
+function validAnswer(answer) {
+	return (
+		typeof answer === "object" &&
+		answer !== null &&
+		typeof answer.askId === "string" &&
+		ASK_ID.test(answer.askId) &&
+		typeof answer.shareId === "string" &&
+		SHARE_ID.test(answer.shareId) &&
+		Number.isSafeInteger(answer.revision) &&
+		(answer.key === null || answer.key === undefined || KEYS.has(answer.key)) &&
+		(answer.text === null ||
+			answer.text === undefined ||
+			typeof answer.text === "string") &&
+		(!!answer.key || !!answer.text)
+	);
 }
 
 function sentText(answer) {
@@ -33,20 +59,26 @@ function sentText(answer) {
 }
 
 export function answerArgs(answer) {
-	const args = ["ask", "answer", answer.askId];
-	if (answer.key) args.push(answer.key);
 	const text = sentText(answer);
-	if (text) args.push("--text", text);
-	args.push("--as", "contact");
+	const args = ["ask", "answer", "--as", "contact"];
+	if (text) args.push(`--text=${text}`);
+	args.push("--", answer.askId);
+	if (answer.key) args.push(answer.key);
 	return args;
 }
+
+const cleaned = (text) =>
+	text
+		?.replace(/\r\n?|[\u2028\u2029]/g, "\n")
+		.replace(/\p{Default_Ignorable_Code_Point}/gu, "")
+		.trim() || null;
 
 function sameDecision(decision, answer) {
 	if (!decision || decision.answered_as !== "contact") return false;
 	const expected = answer.key ?? "other";
 	return (
 		decision.decision === expected &&
-		(decision.text ?? null) === sentText(answer)
+		cleaned(decision.text) === cleaned(sentText(answer))
 	);
 }
 
@@ -58,20 +90,22 @@ export async function relay(
 	const query = new URLSearchParams({ state: "pending" });
 	if (share) query.set("share", share);
 	const summary = { recorded: 0, skipped: 0, failed: 0, more: false };
-	const seen = new Set();
-	for (;;) {
-		const { answers, more } = await api(`/api/v1/answers?${query}`);
-		const fresh = answers.filter(
-			(answer) =>
-				!seen.has(`${answer.shareId}/${answer.askId}/${answer.revision}`),
-		);
-		summary.more = !!more && fresh.length === 0;
-		if (!fresh.length) break;
-		for (const answer of fresh) {
-			seen.add(`${answer.shareId}/${answer.askId}/${answer.revision}`);
+	for (let page = 0; ; page += 1) {
+		if (page === PAGE_LIMIT) {
+			summary.more = true;
+			break;
+		}
+		const { answers, more, next } = await api(`/api/v1/answers?${query}`);
+		for (const answer of Array.isArray(answers) ? answers : []) {
+			if (!validAnswer(answer)) {
+				log("FAILED an answer the server returned is malformed; skipped");
+				summary.failed += 1;
+				continue;
+			}
 			await relayOne(api, zm, answer, { dryRun, log, summary });
 		}
-		if (!more) break;
+		if (!more || typeof next !== "string" || next === query.get("after")) break;
+		query.set("after", next);
 	}
 	return summary;
 }
@@ -109,10 +143,11 @@ async function relayOne(api, zm, answer, { dryRun, log, summary }) {
 			summary.failed += 1;
 			return;
 		}
+		if (result.warning) log(`NOTE ${label}: zm said: ${result.warning}`);
 	}
 	try {
 		await api(
-			`/api/v1/answers/${answer.shareId}/${encodeURIComponent(answer.askId)}/recorded`,
+			`/api/v1/answers/${encodeURIComponent(answer.shareId)}/${encodeURIComponent(answer.askId)}/recorded`,
 			{
 				method: "POST",
 				body: JSON.stringify({ revision: answer.revision }),

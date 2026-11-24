@@ -33,7 +33,9 @@ interface Answer {
 type AnswerEnv = { MEDIA: R2Bucket; ANSWER_LIMIT?: RateLimit };
 
 export const NEEDS_CONTEXT = "needs_context";
-const ASK_ID = /^[0-9A-Za-z_-]{1,64}$/;
+const ASK_ID = /^[0-9A-Za-z_][0-9A-Za-z_-]{0,63}$/;
+const ANSWER_KEY =
+	/^answers\/[a-f0-9-]{36}\/[0-9A-Za-z_][0-9A-Za-z_-]{0,63}\.json$/;
 const SHARE_ID = /^[a-f0-9-]{36}$/;
 const KEYS = ["a", "b", "c", "d"];
 const QUESTION_LIMIT = 20;
@@ -119,7 +121,14 @@ function cleanText(value: unknown): string | undefined {
 			413,
 			`The written answer is limited to ${TEXT_LIMIT} bytes.`,
 		);
-	const text = value.replace(/\r\n?/g, "\n").trim();
+	if (/[\u202a-\u202e\u2066-\u2069]/.test(value))
+		throw new HttpError(400, "The written answer has control characters.");
+	// zm cleans answer text this way before storing it; doing it here keeps the
+	// relay's comparison with what zm holds exact.
+	const text = value
+		.replace(/\r\n?|[\u2028\u2029]/g, "\n")
+		.replace(/\p{Default_Ignorable_Code_Point}/gu, "")
+		.trim();
 	if (
 		!wellFormed(text) ||
 		[...text].some((char) => {
@@ -286,13 +295,15 @@ export async function recipientAnswers(
 async function list(env: AnswerEnv, url: URL): Promise<Response> {
 	const share = url.searchParams.get("share");
 	const state = url.searchParams.get("state") ?? "pending";
+	const after = url.searchParams.get("after");
 	if (
 		(share !== null && !SHARE_ID.test(share)) ||
+		(after !== null && !ANSWER_KEY.test(after)) ||
 		!["pending", "recorded", "all"].includes(state)
 	)
 		throw new HttpError(
 			400,
-			"Use share=ID and state=pending, recorded or all.",
+			"Use share=ID, state=pending, recorded or all, and after=the next value from a previous page.",
 		);
 	const prefix = share ? `answers/${share}/` : "answers/";
 	const keys: string[] = [];
@@ -302,20 +313,24 @@ async function list(env: AnswerEnv, url: URL): Promise<Response> {
 		const page = await env.MEDIA.list({
 			prefix,
 			cursor,
+			...(after && !cursor ? { startAfter: after } : {}),
 			include: ["customMetadata"],
 		});
-		for (const object of page.objects) {
-			if (state === "all" || object.customMetadata?.state === state)
-				keys.push(object.key);
+		const objects = page.objects;
+		for (let i = 0; i < objects.length; i += 1) {
+			const object = objects[i];
+			if (state !== "all" && object.customMetadata?.state !== state) continue;
+			if (keys.length === LIST_LIMIT) {
+				more = true;
+				break;
+			}
+			keys.push(object.key);
 		}
 		cursor = page.truncated ? page.cursor : undefined;
-		if (keys.length >= LIST_LIMIT) {
-			more = cursor !== undefined || keys.length > LIST_LIMIT;
-			break;
-		}
+		if (more) break;
 	} while (cursor);
 	const answers = await Promise.all(
-		keys.slice(0, LIST_LIMIT).map(async (key) => {
+		keys.map(async (key) => {
 			const object = await env.MEDIA.get(key);
 			return object ? await object.json<Answer>() : undefined;
 		}),
@@ -333,6 +348,7 @@ async function list(env: AnswerEnv, url: URL): Promise<Response> {
 				: [],
 		),
 		more,
+		next: more ? (keys.at(-1) ?? null) : null,
 	});
 }
 

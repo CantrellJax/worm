@@ -38,22 +38,28 @@ function fakeZm(asks) {
 	const calls = [];
 	const zm = (args) => {
 		calls.push(args);
-		const [, verb, id] = args;
+		const verb = args[1];
+		const split = args.indexOf("--");
+		const [id, key] = args.slice(split + 1);
 		const ask = asks[id];
 		if (!ask) return { ok: false, output: "not_found" };
 		if (verb === "show") return { ok: true, output: JSON.stringify(ask) };
 		if (verb === "answer") {
 			if (ask.status !== "open") return { ok: false, output: "409 decided" };
-			const key = args[3] && !args[3].startsWith("--") ? args[3] : undefined;
-			const textAt = args.indexOf("--text");
-			const text = textAt > 0 ? args[textAt + 1] : null;
+			const textFlag = args.find((arg) => arg.startsWith("--text="));
+			const text = textFlag
+				? textFlag
+						.slice(7)
+						.replace(/\u200b/g, "")
+						.trim()
+				: null;
 			ask.status = "answered";
 			ask.decision = {
 				decision: key ?? "other",
 				text,
 				answered_as: args[args.indexOf("--as") + 1],
 			};
-			return { ok: true, output: "{}" };
+			return { ok: true, output: "{}", warning: "" };
 		}
 		return { ok: false, output: "unknown" };
 	};
@@ -163,24 +169,24 @@ test("relay answers each pending ask as the contact, marks it recorded, and reco
 		[
 			"ask",
 			"answer",
-			"ASK1",
-			"b",
-			"--text",
-			"Made-up reason",
 			"--as",
 			"contact",
+			"--text=Made-up reason",
+			"--",
+			"ASK1",
+			"b",
 		],
 		[
 			"ask",
 			"answer",
-			"ASK2",
-			"needs_context",
-			"--text",
-			"The contact could not answer this on the page.",
 			"--as",
 			"contact",
+			"--text=The contact could not answer this on the page.",
+			"--",
+			"ASK2",
+			"needs_context",
 		],
-		["ask", "answer", "ASK3", "--text", "Only words", "--as", "contact"],
+		["ask", "answer", "--as", "contact", "--text=Only words", "--", "ASK3"],
 	]);
 	assert.deepEqual(asks.ASK1.decision, {
 		decision: "b",
@@ -210,4 +216,100 @@ test("relay re-run after zm took the answer but marking failed only marks it", a
 	const result = await relay(api, zm, { share: id, log: () => {} });
 	assert.equal(result.recorded, 1);
 	assert.equal(calls.filter((args) => args[1] === "answer").length, 0);
+});
+
+test("relay pages past answers it has to skip, and zm's own text cleaning does not make a re-run skip", async () => {
+	const asks = {};
+	for (let i = 0; i < 45; i += 1) {
+		const id = `ASKP${String(i).padStart(2, "0")}`;
+		asks[id] = {
+			...heldAsk(id, `Made-up question ${i}?`),
+			status: "withdrawn",
+		};
+	}
+	asks.ASKZ = heldAsk("ASKZ", "Made-up last question?");
+	const { zm, calls } = fakeZm(asks);
+	const ids = Object.keys(asks);
+	const shares = [];
+	for (let i = 0; i < ids.length; i += 20) {
+		const chunk = ids.slice(i, i + 20);
+		for (const id of chunk) asks[id].status = "open";
+		const spec = specFromAsks(zm, chunk);
+		for (const id of chunk) if (id !== "ASKZ") asks[id].status = "withdrawn";
+		shares.push(await sharePage(api, ORIGIN, spec, { days: 1 }));
+	}
+	for (const [index, shared] of shares.entries())
+		for (const id of ids.slice(index * 20, index * 20 + 20))
+			await answer(shared.link, id, {
+				key: "a",
+				...(id === "ASKZ" ? { text: "Yes\u200b please" } : {}),
+			});
+	const first = await relay(api, zm, { log: () => {} });
+	assert.equal(first.skipped >= 45, true);
+	assert.equal(asks.ASKZ.decision.decision, "a");
+	assert.equal(asks.ASKZ.decision.text, "Yes please");
+	assert.equal(first.recorded >= 1, true);
+
+	const extra = heldAsk("ASKY", "Made-up crash question?");
+	asks.ASKY = extra;
+	const shared = await sharePage(api, ORIGIN, specFromAsks(zm, ["ASKY"]), {
+		days: 1,
+	});
+	const id = await answer(shared.link, "ASKY", {
+		key: "b",
+		text: "Fine\u200b by me",
+	});
+	zm(answerArgs({ askId: "ASKY", key: "b", text: "Fine\u200b by me" }));
+	calls.length = 0;
+	const rerun = await relay(api, zm, { share: id, log: () => {} });
+	assert.equal(rerun.recorded, 1);
+	assert.equal(calls.filter((args) => args[1] === "answer").length, 0);
+});
+
+test("relay refuses malformed answers from the server and never lets a field become a zm option", async () => {
+	const { zm, calls } = fakeZm({ ASK1: heldAsk("ASK1", "Made-up?") });
+	const hostile = [
+		{
+			shareId: "11111111-2222-3333-4444-555555555555",
+			askId: "-P",
+			key: "a",
+			revision: 1,
+		},
+		{
+			shareId: "11111111-2222-3333-4444-555555555555",
+			askId: "ASK1",
+			key: "--project=evil",
+			revision: 1,
+		},
+		{ shareId: "../../shares/x", askId: "ASK1", key: "a", revision: 1 },
+		{
+			shareId: "11111111-2222-3333-4444-555555555555",
+			askId: "ASK1",
+			revision: 1,
+		},
+	];
+	let pages = 0;
+	const fakeApi = async (path) => {
+		if (path.includes("/recorded")) throw new Error("must not mark");
+		pages += 1;
+		return { answers: hostile, more: true, next: `answers/x/${pages}.json` };
+	};
+	const result = await relay(fakeApi, zm, { log: () => {} });
+	assert.equal(result.failed, hostile.length * pages);
+	assert.equal(calls.length, 0);
+	assert.equal(pages, 50);
+	assert.equal(result.more, true);
+	assert.deepEqual(
+		answerArgs({ askId: "ASK1", key: "a", text: "--as owner -h" }),
+		[
+			"ask",
+			"answer",
+			"--as",
+			"contact",
+			"--text=--as owner -h",
+			"--",
+			"ASK1",
+			"a",
+		],
+	);
 });
