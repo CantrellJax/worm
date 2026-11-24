@@ -39,7 +39,7 @@ const KEYS = ["a", "b", "c", "d"];
 const QUESTION_LIMIT = 20;
 const TEXT_LIMIT = 2000;
 const BODY_LIMIT = 16 * 1024;
-const LIST_LIMIT = 1000;
+const LIST_LIMIT = 40;
 const encoder = new TextEncoder();
 
 export function answerToken(readToken: string): Promise<string> {
@@ -101,6 +101,15 @@ function withCors(result: Response, origin: string): Response {
 	return cors;
 }
 
+function wellFormed(text: string): boolean {
+	try {
+		encodeURIComponent(text);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 function cleanText(value: unknown): string | undefined {
 	if (value === undefined || value === null) return;
 	if (typeof value !== "string")
@@ -112,9 +121,15 @@ function cleanText(value: unknown): string | undefined {
 		);
 	const text = value.replace(/\r\n?/g, "\n").trim();
 	if (
+		!wellFormed(text) ||
 		[...text].some((char) => {
 			const code = char.charCodeAt(0);
-			return (code < 32 && char !== "\n" && char !== "\t") || code === 127;
+			return (
+				(code < 32 && char !== "\n" && char !== "\t") ||
+				(code >= 127 && code <= 159) ||
+				(code >= 0x202a && code <= 0x202e) ||
+				(code >= 0x2066 && code <= 0x2069)
+			);
 		})
 	)
 		throw new HttpError(400, "The written answer has control characters.");
@@ -200,7 +215,9 @@ async function submit(
 		JSON.stringify(answer),
 		{
 			customMetadata: { state: "pending" },
-			...(earlier ? { onlyIf: { etagMatches: earlier.etag } } : {}),
+			onlyIf: earlier
+				? { etagMatches: earlier.etag }
+				: { etagDoesNotMatch: "*" },
 		},
 	);
 	if (!written)

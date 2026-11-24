@@ -299,6 +299,8 @@ test("answers: a wrong token, ask id, key, oversize or disallowed text is refuse
 		await page.send({ askId: ASK_TWO, key: "a", text: "no text here" }),
 		400,
 	);
+	for (const text of ["a\u202Eb", "a\u2066b", "a\u009Bb", "a\uD800b"])
+		await refused(await page.send({ askId: ASK_ONE, key: "a", text }), 400);
 	await refused(await page.send("{not json"), 400);
 	await refused(await page.send("[]"), 400);
 	await refused(
@@ -619,6 +621,11 @@ test("page kit: one self-contained page with every question, escaped text and on
 		"<form action=x>",
 		"<meta http-equiv=refresh>",
 		"<base href=x>",
+		"<plaintext>",
+		"<!-- open",
+		"<textarea>",
+		"<noscript>",
+		"<style>p{}</style>",
 	])
 		assert.throws(() => validate({ ...spec, html }), /may not contain/);
 	assert.throws(

@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 const KEYS = ["a", "b", "c", "d"];
 const ASK_ID = /^[0-9A-Za-z_-]{1,64}$/;
 const BLOCKED =
-	/<\s*\/?\s*(script|iframe|frame|object|embed|base|meta|link|form)\b/i;
+	/<!--|<\s*\/?\s*(script|iframe|frame|object|embed|base|meta|link|form|plaintext|xmp|textarea|noscript|noembed|noframes|title|style|select|template)\b/i;
 
 const escape = (value) =>
 	String(value)
@@ -31,7 +31,7 @@ function fragment(value, name) {
 		);
 	if (BLOCKED.test(value))
 		throw new Error(
-			`${name} may not contain script, frame, object, embed, base, meta, link or form tags.`,
+			`${name} may not contain comments or script, frame, object, embed, base, meta, link, form, plaintext, xmp, textarea, noscript, title, style, select or template tags.`,
 		);
 	return value;
 }
